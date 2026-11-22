@@ -41,6 +41,16 @@ Options include `--nodes`, `--degree`, `--queries`, `--depth`, and `--threads`.
 The output reports p50, p95, p99, maximum, and mean per-query latency in
 microseconds, plus aggregate queries per second.
 
+For repeated access to one hot vertex, use:
+
+```sh
+./build/low_latency_graphdb_hot_node_benchmark \
+  --degree 64 --queries 2000 --threads 4
+```
+
+This repeatedly runs a depth-1 query from vertex `0` after warming the graph,
+and reports the same latency metrics.
+
 ## Test
 
 ```sh
