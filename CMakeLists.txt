@@ -35,6 +35,13 @@ target_link_libraries(low_latency_graphdb_hot_node_benchmark
     PRIVATE low_latency_graphdb_core
 )
 
+add_executable(low_latency_graphdb_cache_core_benchmark
+    benchmarks/cache_core_benchmark.cpp
+)
+target_link_libraries(low_latency_graphdb_cache_core_benchmark
+    PRIVATE low_latency_graphdb_core
+)
+
 if(MSVC)
     target_compile_options(low_latency_graphdb_core INTERFACE /W4 /permissive-)
 else()

@@ -51,6 +51,16 @@ For repeated access to one hot vertex, use:
 This repeatedly runs a depth-1 query from vertex `0` after warming the graph,
 and reports the same latency metrics.
 
+To isolate the cache-resident 64-byte node scan itself:
+
+```sh
+./build/low_latency_graphdb_cache_core_benchmark 10000000 1
+```
+
+The first argument is scan iterations and the second is worker count. This
+benchmark intentionally excludes graph lookup, query allocation, result
+materialization, and thread scheduling inside each scan.
+
 ## Test
 
 ```sh
