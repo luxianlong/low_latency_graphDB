@@ -21,6 +21,13 @@ add_executable(low_latency_graphdb
 )
 target_link_libraries(low_latency_graphdb PRIVATE low_latency_graphdb_core)
 
+add_executable(low_latency_graphdb_latency_benchmark
+    benchmarks/latency_benchmark.cpp
+)
+target_link_libraries(low_latency_graphdb_latency_benchmark
+    PRIVATE low_latency_graphdb_core
+)
+
 if(MSVC)
     target_compile_options(low_latency_graphdb_core INTERFACE /W4 /permissive-)
 else()

@@ -5,9 +5,9 @@
 #include "low_latency_graphdb/query_arena.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -21,19 +21,25 @@ using low_latency_graphdb::ZeroCopyAdjView;
 
 namespace {
 
+void require(bool condition) {
+    if (!condition) {
+        std::abort();
+    }
+}
+
 void test_query_arena() {
     QueryArena arena(128, 512);
     auto* first = static_cast<std::uint64_t*>(arena.allocate(sizeof(std::uint64_t), alignof(std::uint64_t)));
-    assert(reinterpret_cast<std::uintptr_t>(first) % alignof(std::uint64_t) == 0);
+    require(reinterpret_cast<std::uintptr_t>(first) % alignof(std::uint64_t) == 0);
     *first = 42;
-    assert(*first == 42);
+    require(*first == 42);
 
     auto* overflow = arena.allocate(200, 64);
-    assert(overflow != nullptr);
-    assert(arena.used_bytes() >= 200);
+    require(overflow != nullptr);
+    require(arena.used_bytes() >= 200);
 
     arena.reset();
-    assert(arena.used_bytes() == 0);
+    require(arena.used_bytes() == 0);
 
     bool quota_failed = false;
     try {
@@ -41,7 +47,7 @@ void test_query_arena() {
     } catch (const std::runtime_error&) {
         quota_failed = true;
     }
-    assert(quota_failed);
+    require(quota_failed);
 }
 
 void test_slab_pool() {
@@ -49,13 +55,13 @@ void test_slab_pool() {
     FixedSlabPool pool(2);
     auto* first = pool.allocate();
     auto* second = pool.allocate();
-    assert(first != nullptr);
-    assert(second != nullptr);
-    assert(pool.allocate() == nullptr);
+    require(first != nullptr);
+    require(second != nullptr);
+    require(pool.allocate() == nullptr);
     pool.release(first);
-    assert(pool.available() == 1);
+    require(pool.available() == 1);
     pool.release(second);
-    assert(pool.available() == 2);
+    require(pool.available() == 2);
 }
 
 std::vector<char> make_adjacency_buffer() {
@@ -73,10 +79,10 @@ std::vector<char> make_adjacency_buffer() {
 void test_adjacency_view() {
     auto buffer = make_adjacency_buffer();
     ZeroCopyAdjView view(buffer.data(), buffer.size());
-    assert(view.size() == 2);
-    assert(view.target(0) == 101);
-    assert(view.target(1) == 202);
-    assert(view.edge_metas()[1].edge_type == 8);
+    require(view.size() == 2);
+    require(view.target(0) == 101);
+    require(view.target(1) == 202);
+    require(view.edge_metas()[1].edge_type == 8);
 
     bool bounds_failed = false;
     try {
@@ -84,7 +90,7 @@ void test_adjacency_view() {
     } catch (const std::out_of_range&) {
         bounds_failed = true;
     }
-    assert(bounds_failed);
+    require(bounds_failed);
 
     std::vector<char> truncated(buffer.begin(), buffer.end() - 1);
     bool truncated_failed = false;
@@ -93,7 +99,7 @@ void test_adjacency_view() {
     } catch (const std::invalid_argument&) {
         truncated_failed = true;
     }
-    assert(truncated_failed);
+    require(truncated_failed);
 }
 
 void test_breadth_first_search() {
@@ -107,13 +113,13 @@ void test_breadth_first_search() {
 
     low_latency_graphdb::BreadthFirstSearch search(graph);
     const auto depth_two = search.run(1, 2);
-    assert((depth_two.visited == std::vector<std::uint64_t>{1, 2, 3, 4}));
+    require((depth_two.visited == std::vector<std::uint64_t>{1, 2, 3, 4}));
 
     const auto depth_zero = search.run(1, 0);
-    assert((depth_zero.visited == std::vector<std::uint64_t>{1}));
+    require((depth_zero.visited == std::vector<std::uint64_t>{1}));
 
     const auto missing = search.run(999, 10);
-    assert(missing.visited.empty());
+    require(missing.visited.empty());
 
     low_latency_graphdb::InMemoryGraph high_degree;
     high_degree.add_vertex(100);
@@ -122,7 +128,7 @@ void test_breadth_first_search() {
     }
     const auto overflow_result =
         low_latency_graphdb::BreadthFirstSearch(high_degree).run(100, 1);
-    assert(overflow_result.visited.size() == 13);
+    require(overflow_result.visited.size() == 13);
 }
 
 }  // namespace

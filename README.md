@@ -29,6 +29,18 @@ The executable builds a small in-memory graph and runs a depth-limited BFS as
 a smoke test. The traversal engine can currently be used with
 `InMemoryGraph::add_edge` and `BreadthFirstSearch::run`.
 
+## Latency benchmark
+
+Build and run the deterministic parallel benchmark:
+
+```sh
+./build/low_latency_graphdb_latency_benchmark
+```
+
+Options include `--nodes`, `--degree`, `--queries`, `--depth`, and `--threads`.
+The output reports p50, p95, p99, maximum, and mean per-query latency in
+microseconds, plus aggregate queries per second.
+
 ## Test
 
 ```sh
