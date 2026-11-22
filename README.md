@@ -3,8 +3,9 @@
 A low-latency graph database implemented in C++.
 
 The current core includes a bounded query arena, a cache-line-sized hot-node
-slab, and a bounds-checked adjacency view. RocksDB integration will be added
-after the canonical storage schema is stabilized.
+slab, a bounds-checked adjacency view, and an in-memory breadth-first traversal
+engine. RocksDB integration will be added after the canonical storage schema
+is stabilized.
 
 ## Requirements
 
@@ -23,6 +24,10 @@ cmake --build build
 ```sh
 ./build/low_latency_graphdb
 ```
+
+The executable builds a small in-memory graph and runs a depth-limited BFS as
+a smoke test. The traversal engine can currently be used with
+`InMemoryGraph::add_edge` and `BreadthFirstSearch::run`.
 
 ## Test
 

@@ -1,7 +1,10 @@
 #include "low_latency_graphdb/adjacency_view.hpp"
+#include "low_latency_graphdb/breadth_first_search.hpp"
 #include "low_latency_graphdb/graph_node_slab.hpp"
+#include "low_latency_graphdb/in_memory_graph.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -93,11 +96,41 @@ void test_adjacency_view() {
     assert(truncated_failed);
 }
 
+void test_breadth_first_search() {
+    low_latency_graphdb::InMemoryGraph graph;
+    graph.add_edge(1, 2);
+    graph.add_edge(1, 3);
+    graph.add_edge(2, 4);
+    graph.add_edge(3, 4);
+    graph.add_edge(4, 5);
+    graph.add_edge(5, 1);
+
+    low_latency_graphdb::BreadthFirstSearch search(graph);
+    const auto depth_two = search.run(1, 2);
+    assert((depth_two.visited == std::vector<std::uint64_t>{1, 2, 3, 4}));
+
+    const auto depth_zero = search.run(1, 0);
+    assert((depth_zero.visited == std::vector<std::uint64_t>{1}));
+
+    const auto missing = search.run(999, 10);
+    assert(missing.visited.empty());
+
+    low_latency_graphdb::InMemoryGraph high_degree;
+    high_degree.add_vertex(100);
+    for (std::uint64_t id = 0; id < 12; ++id) {
+        high_degree.add_edge(100, 1000 + id);
+    }
+    const auto overflow_result =
+        low_latency_graphdb::BreadthFirstSearch(high_degree).run(100, 1);
+    assert(overflow_result.visited.size() == 13);
+}
+
 }  // namespace
 
 int main() {
     test_query_arena();
     test_slab_pool();
     test_adjacency_view();
+    test_breadth_first_search();
     std::cout << "core tests passed\n";
 }
