@@ -1,0 +1,8 @@
+# CMake build output
+build/
+
+# IDE and compiler artifacts
+.cache/
+.clangd/
+.vscode/
+compile_commands.json
