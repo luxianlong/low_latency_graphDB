@@ -51,7 +51,7 @@ std::uint64_t percentile(
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::size_t degree = option(argc, argv, "--degree", 64);
+    const std::size_t degree = option(argc, argv, "--degree", 8);
     const std::size_t query_count = option(argc, argv, "--queries", 2'000);
     const std::size_t requested_threads =
         option(argc, argv, "--threads", std::thread::hardware_concurrency());
