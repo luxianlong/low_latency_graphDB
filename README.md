@@ -77,18 +77,20 @@ cmake --build build --target benchmark-cache-core
 For a real cache-resident BFS query with reusable queue and visited state:
 
 ```sh
-./build/low_latency_graphdb_cache_resident_bfs_benchmark 10000000 1
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000000 1 1 1000000
 ```
 
-Arguments are `iterations`, `threads`, and optional `depth`. For example:
+Arguments are `iterations`, `threads`, optional `depth`, and optional node
+count. For example:
 
 ```sh
-./build/low_latency_graphdb_cache_resident_bfs_benchmark 10000000 1 3
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000000 1 3 1000000
 ```
 
-This uses a 64-node graph (4 KiB of slabs), fanout 8, and measures repeated
-BFS queries without hash lookup, heap allocation, or result-vector construction
-in the timed loop.
+The default graph has 1,000,000 nodes (64 MiB of slabs), fanout 8, and the
+depth-1/2/3 query touches only its hot local neighborhood. Reusable
+generation-stamped query state avoids clearing a million-entry bitmap between
+queries.
 
 ## Test
 

@@ -16,31 +16,66 @@
 
 namespace {
 
-constexpr std::size_t kNodeCount = 64;
 constexpr std::uint32_t kFanout = 8;
+constexpr std::size_t kVisitedCapacity = 2048;
 using Clock = std::chrono::steady_clock;
 using Node = low_latency_graphdb::GraphNodeSlab;
 using LocalId = low_latency_graphdb::LocalNodeId;
 
 struct CacheResidentGraph {
-    std::array<Node, kNodeCount> nodes{};
-
-    CacheResidentGraph() {
-        for (std::size_t source = 0; source < kNodeCount; ++source) {
+    explicit CacheResidentGraph(std::size_t node_count)
+        : nodes(node_count) {
+        for (std::size_t source = 0; source < nodes.size(); ++source) {
             nodes[source].node_id = source;
             nodes[source].count = kFanout;
             for (std::uint32_t edge = 0; edge < kFanout; ++edge) {
                 nodes[source].inline_neighbors[edge] =
-                    static_cast<LocalId>((source + edge + 1) % kNodeCount);
+                    static_cast<LocalId>((source + edge + 1) % nodes.size());
             }
         }
     }
+
+    std::vector<Node> nodes;
 };
 
 struct TraversalState {
-    std::array<LocalId, kNodeCount> queue{};
-    std::array<std::uint32_t, kNodeCount> depths{};
-    std::array<std::uint8_t, kNodeCount> visited{};
+    struct SeenEntry {
+        LocalId node{0};
+        std::uint32_t generation{0};
+    };
+
+    std::array<LocalId, kVisitedCapacity> queue{};
+    std::array<std::uint32_t, kVisitedCapacity> depths{};
+    std::array<SeenEntry, kVisitedCapacity> seen{};
+    std::uint32_t generation{0};
+
+    void begin_query() noexcept {
+        ++generation;
+        if (generation == 0) {
+            for (auto& entry : seen) {
+                entry.generation = 0;
+            }
+            generation = 1;
+        }
+    }
+
+    bool mark_seen(LocalId node) noexcept {
+        constexpr std::size_t mask = kVisitedCapacity - 1;
+        std::size_t slot = (static_cast<std::size_t>(node) * 2654435761U) & mask;
+        for (std::size_t probe = 0; probe < kVisitedCapacity; ++probe) {
+            auto& entry = seen[slot];
+            if (entry.generation != generation) {
+                entry.node = node;
+                entry.generation = generation;
+                return true;
+            }
+            if (entry.node == node) {
+                return false;
+            }
+            slot = (slot + 1) & mask;
+        }
+        return false;
+    }
 };
 
 #if defined(__clang__) || defined(__GNUC__)
@@ -51,10 +86,10 @@ std::size_t run_query(
     TraversalState& state,
     LocalId start,
     std::uint32_t max_depth) noexcept {
-    std::memset(state.visited.data(), 0, state.visited.size());
+    state.begin_query();
     state.queue[0] = start;
     state.depths[0] = 0;
-    state.visited[start] = 1;
+    state.mark_seen(start);
 
     std::size_t head = 0;
     std::size_t tail = 1;
@@ -71,8 +106,7 @@ std::size_t run_query(
         const Node& node = graph.nodes[current];
         for (std::uint32_t i = 0; i < node.count; ++i) {
             const LocalId neighbor = node.inline_neighbors[i];
-            if (state.visited[neighbor] == 0) {
-                state.visited[neighbor] = 1;
+            if (state.mark_seen(neighbor)) {
                 state.queue[tail] = neighbor;
                 state.depths[tail] = depth + 1;
                 ++tail;
@@ -91,12 +125,14 @@ int main(int argc, char** argv) {
         argc > 2 ? std::stoull(argv[2]) : 1;
     const std::uint32_t depth =
         argc > 3 ? static_cast<std::uint32_t>(std::stoull(argv[3])) : 1;
-    if (iterations == 0 || threads == 0 || depth > kNodeCount) {
-        std::cerr << "iterations and threads must be positive; depth must fit the graph\n";
+    const std::size_t node_count =
+        argc > 4 ? std::stoull(argv[4]) : 1'000'000;
+    if (iterations == 0 || threads == 0 || node_count == 0) {
+        std::cerr << "iterations, threads, and nodes must be positive\n";
         return EXIT_FAILURE;
     }
 
-    const CacheResidentGraph graph;
+    const CacheResidentGraph graph(node_count);
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(threads + 1));
     std::vector<std::uint64_t> checksums(threads);
     std::vector<std::thread> workers;
@@ -133,8 +169,8 @@ int main(int argc, char** argv) {
     const double ns_per_query =
         static_cast<double>(elapsed_ns) / static_cast<double>(total_queries);
 
-    std::cout << "cache_graph_nodes=" << kNodeCount
-              << " graph_bytes=" << sizeof(graph)
+    std::cout     << "cache_graph_nodes=" << graph.nodes.size()
+    << " graph_bytes=" << graph.nodes.size() * sizeof(Node)
               << " node_bytes=" << sizeof(Node)
               << " fanout=" << kFanout
               << " depth=" << depth
