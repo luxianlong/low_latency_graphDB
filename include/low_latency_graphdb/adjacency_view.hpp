@@ -6,7 +6,6 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
-#include <vector>
 
 namespace low_latency_graphdb {
 
@@ -29,74 +28,66 @@ public:
         reset(data, size);
     }
 
+    // Never copies the payload. Elements are read in place; when the storage
+    // page is not naturally aligned, per-element memcpy loads (a single
+    // unaligned load instruction) replace the typed span access.
     void reset(const char* data, std::size_t size) {
-        data_ = data;
-        size_ = size;
-        target_ids_ = {};
-        edge_metas_ = {};
-        fallback_targets_.clear();
-        fallback_metas_.clear();
-        is_zero_copy_ = false;
+        data_ = nullptr;
+        count_ = 0;
+        aligned_ = false;
 
-        if (data_ == nullptr || size_ < kHeaderSize) {
+        if (data == nullptr || size < kHeaderSize) {
             throw std::invalid_argument("ZeroCopyAdjView: truncated header");
         }
 
-        const std::uint32_t count = read_u32(data_);
+        const std::uint32_t count = read_u32(data);
         const std::size_t target_bytes = checked_multiply(count, sizeof(NodeId));
         const std::size_t meta_bytes = checked_multiply(count, sizeof(EdgeLightMeta));
         const std::size_t expected = checked_add(kHeaderSize, checked_add(target_bytes, meta_bytes));
-        if (expected > size_) {
+        if (expected > size) {
             throw std::invalid_argument("ZeroCopyAdjView: truncated adjacency payload");
         }
 
-        const char* targets = data_ + kHeaderSize;
-        const char* metas = targets + target_bytes;
-        if (is_aligned(targets, alignof(NodeId)) &&
-            is_aligned(metas, alignof(EdgeLightMeta))) {
-            target_ids_ = std::span<const NodeId>(
-                reinterpret_cast<const NodeId*>(targets), count);
-            edge_metas_ = std::span<const EdgeLightMeta>(
-                reinterpret_cast<const EdgeLightMeta*>(metas), count);
-            is_zero_copy_ = true;
-            return;
-        }
-
-        fallback_targets_.resize(count);
-        fallback_metas_.resize(count);
-        std::memcpy(fallback_targets_.data(), targets, target_bytes);
-        std::memcpy(fallback_metas_.data(), metas, meta_bytes);
-        target_ids_ = fallback_targets_;
-        edge_metas_ = fallback_metas_;
+        data_ = data;
+        count_ = count;
+        targets_ = data + kHeaderSize;
+        metas_ = targets_ + target_bytes;
+        aligned_ = is_aligned(targets_, alignof(NodeId)) &&
+                   is_aligned(metas_, alignof(EdgeLightMeta));
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
-        return target_ids_.size();
+        return count_;
     }
 
+    // True when typed spans (targets()/edge_metas()) are available.
     [[nodiscard]] bool is_zero_copy() const noexcept {
-        return is_zero_copy_;
+        return aligned_;
     }
 
     [[nodiscard]] NodeId target(std::size_t index) const {
-        if (index >= target_ids_.size()) {
-            throw std::out_of_range("ZeroCopyAdjView: target index out of bounds");
-        }
-        if (is_zero_copy_) {
-            return target_ids_[index];
-        }
+        check_index(index);
         NodeId value{};
-        const char* source = data_ + kHeaderSize + index * sizeof(NodeId);
-        std::memcpy(&value, source, sizeof(value));
+        std::memcpy(&value, targets_ + index * sizeof(NodeId), sizeof(value));
         return value;
     }
 
-    [[nodiscard]] std::span<const NodeId> targets() const noexcept {
-        return target_ids_;
+    [[nodiscard]] EdgeLightMeta meta(std::size_t index) const {
+        check_index(index);
+        EdgeLightMeta value{};
+        std::memcpy(&value, metas_ + index * sizeof(EdgeLightMeta), sizeof(value));
+        return value;
     }
 
-    [[nodiscard]] std::span<const EdgeLightMeta> edge_metas() const noexcept {
-        return edge_metas_;
+    // Typed spans; only valid for naturally aligned payloads (is_zero_copy()).
+    [[nodiscard]] std::span<const NodeId> targets() const {
+        require_aligned();
+        return {reinterpret_cast<const NodeId*>(targets_), count_};
+    }
+
+    [[nodiscard]] std::span<const EdgeLightMeta> edge_metas() const {
+        require_aligned();
+        return {reinterpret_cast<const EdgeLightMeta*>(metas_), count_};
     }
 
 private:
@@ -124,13 +115,23 @@ private:
         return left * right;
     }
 
+    void check_index(std::size_t index) const {
+        if (index >= count_) {
+            throw std::out_of_range("ZeroCopyAdjView: index out of bounds");
+        }
+    }
+
+    void require_aligned() const {
+        if (!aligned_) {
+            throw std::logic_error("ZeroCopyAdjView: payload is unaligned; use target(i)/meta(i)");
+        }
+    }
+
     const char* data_{nullptr};
-    std::size_t size_{0};
-    std::span<const NodeId> target_ids_{};
-    std::span<const EdgeLightMeta> edge_metas_{};
-    std::vector<NodeId> fallback_targets_;
-    std::vector<EdgeLightMeta> fallback_metas_;
-    bool is_zero_copy_{false};
+    const char* targets_{nullptr};
+    const char* metas_{nullptr};
+    std::size_t count_{0};
+    bool aligned_{false};
 };
 
 }  // namespace low_latency_graphdb

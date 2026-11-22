@@ -4,13 +4,76 @@ A low-latency graph database implemented in C++.
 
 The current core includes a bounded query arena, a cache-line-sized hot-node
 slab, a bounds-checked adjacency view, and an in-memory breadth-first traversal
-engine. RocksDB integration will be added after the canonical storage schema
-is stabilized.
+engine. `RocksDbGraphStore` (`rocksdb_graph_store.hpp`) provides the RocksDB
+storage layer from design spec 03/04: column families `cf_topo`,
+`cf_vertex_props`, `cf_edge_props`; big-endian keys; atomic `WriteBatch`
+writes; snapshot reads; zero-copy adjacency via `ZeroCopyAdjView`; batched
+`MultiGet` late materialization with a 10,000-key fan-out guard; and
+`load_into(InMemoryGraph)` to warm the hot tier. `StorageBreadthFirstSearch`
+(`storage_bfs.hpp`) traverses directly from RocksDB: level-synchronous, one
+snapshot, with each level's adjacency rows fetched in sorted `MultiGet` chunks
+whose block-cache pages stay pinned (`PinnableSlice`) only while that chunk is
+consumed. `StorageBfsStats` reports pinned vs copied rows. `TieredGraph`
+(`tiered_graph.hpp`) puts an immutable in-memory `HotTier` (`hot_tier.hpp`) in
+front of RocksDB so hot traversals avoid per-hop RocksDB calls; see
+[Architecture](#architecture).
+
+## Architecture
+
+```mermaid
+flowchart TB
+    Q[Query: start vertex, max_depth] --> BFS
+
+    subgraph TG[TieredGraph - tiered_graph.hpp]
+        BFS[Level-synchronous BFS<br/>hot and cold frontiers]
+        VIS[Visited sets<br/>DenseStampSet: local IDs<br/>GenerationSet: unknown IDs]
+        BFS --- VIS
+    end
+
+    subgraph T1[Tier 1: HotTier - immutable, hot_tier.hpp]
+        SL[64-byte GraphNodeSlab per vertex<br/>local u32 IDs, stubs for non-hot neighbors]
+        MAP[Flat NodeId to local ID map]
+        DIRTY[Atomic dirty flag per vertex]
+    end
+
+    subgraph T2[Tier 2: RocksDbGraphStore - source of truth]
+        TOPO[(cf_topo<br/>adjacency rows)]
+        VP[(cf_vertex_props)]
+        EP[(cf_edge_props)]
+        PIN[Sorted MultiGet<br/>PinnableSlice pins block-cache pages]
+        ZC[ZeroCopyAdjView<br/>no payload copy]
+        PIN --- TOPO
+        PIN --> ZC
+    end
+
+    BFS -- "hot and not dirty: slab read" --> SL
+    BFS -- "cold, dirty or unknown: chunked pinned MultiGet" --> PIN
+    ZC --> BFS
+
+    W[TieredGraph::write_adjacency] -- "1. atomic WriteBatch" --> TOPO
+    W -- "2. mark dirty" --> DIRTY
+    R[warm / warm_top_degree] -- "rebuild from RocksDB, publish new version" --> T1
+```
+
+- **Read path:** hot vertices are expanded from in-memory slabs; everything
+  else is fetched from RocksDB in sorted, pinned `MultiGet` chunks and read in
+  place through `ZeroCopyAdjView`.
+- **Write path:** `TieredGraph::write_adjacency` commits to RocksDB first, then
+  marks the hot copy dirty, so later queries read that vertex from RocksDB.
+  Writes made directly on `RocksDbGraphStore` are not seen by the tier until it
+  is rebuilt with `warm()` / `warm_top_degree()`. Vertex and edge properties
+  are never cached in the tier.
+- **Concurrency:** queries take no locks; each thread owns a `TieredBfsState`
+  that caches the current tier and is refreshed only when the tier version
+  changes.
 
 ## Requirements
 
 - CMake 3.20 or newer
 - A C++20-compatible compiler
+- RocksDB: an installed `RocksDBConfig.cmake` is used if found; otherwise
+  v9.7.4 is fetched and built from source. Configure with
+  `-DLLG_ENABLE_ROCKSDB=OFF` to skip the storage layer.
 
 ## Build
 
@@ -122,6 +185,24 @@ starting nodes used in a reproducible pseudo-random pattern:
 ./build/low_latency_graphdb_cache_resident_bfs_benchmark 0 1 2 10000000 64 100
 ./build/low_latency_graphdb_cache_resident_bfs_benchmark 0 1 2 10000000 64 10000
 ```
+
+## RocksDB BFS benchmark
+
+```sh
+./build/low_latency_graphdb_rocksdb_bfs_benchmark \
+  --nodes 200000 --fanout 8 --depth 3 --threads 1,4,8 --queries 2000
+```
+
+Builds a deterministic tree, bulk-loads and reopens RocksDB (cold cache), warms
+the block cache, then reports per-query p50/p95/p99/max/mean, aggregate QPS,
+visited vertices per query, and the share of adjacency rows served from pinned
+cache pages. It also reports a `tiered` row (hot tier over RocksDB). Options:
+`--pin-batch`, `--cache-mb`, `--path`, `--keep`, `--no-baseline`,
+`--hot-tier K` (vertex IDs `[0, K)`, default nodes/20), `--hot-pct P` (share of
+starts whose neighborhood is hot), `--hot-nodes N` (draw starts from `[0, N)`),
+`--batch B` (queries per timed sample; latency is reported per query in ns) and
+`--collect` (materialize visited IDs). The in-memory baseline allocates per-query arrays sized to the
+whole graph, so it scales poorly with node count and is not a tuned reference.
 
 ## Test
 

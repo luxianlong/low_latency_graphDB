@@ -68,6 +68,40 @@ else()
     target_compile_options(low_latency_graphdb_core INTERFACE -Wall -Wextra -Wpedantic)
 endif()
 
+option(LLG_ENABLE_ROCKSDB "Build the RocksDB storage layer" ON)
+if(LLG_ENABLE_ROCKSDB)
+    find_package(RocksDB CONFIG QUIET)
+    if(RocksDB_FOUND)
+        set(LLG_ROCKSDB_TARGET RocksDB::rocksdb)
+    else()
+        include(FetchContent)
+        set(WITH_TESTS OFF CACHE BOOL "" FORCE)
+        set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
+        set(WITH_BENCHMARK_TOOLS OFF CACHE BOOL "" FORCE)
+        set(WITH_CORE_TOOLS OFF CACHE BOOL "" FORCE)
+        set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
+        set(PORTABLE ON CACHE BOOL "" FORCE)
+        set(FAIL_ON_WARNINGS OFF CACHE BOOL "" FORCE)
+        set(ROCKSDB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(rocksdb
+            GIT_REPOSITORY https://github.com/facebook/rocksdb.git
+            GIT_TAG v9.7.4
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(rocksdb)
+        set(LLG_ROCKSDB_TARGET rocksdb)
+    endif()
+    add_library(low_latency_graphdb_storage INTERFACE)
+    target_link_libraries(low_latency_graphdb_storage
+        INTERFACE low_latency_graphdb_core ${LLG_ROCKSDB_TARGET})
+    add_executable(low_latency_graphdb_rocksdb_bfs_benchmark
+        benchmarks/rocksdb_bfs_benchmark.cpp)
+    target_link_libraries(low_latency_graphdb_rocksdb_bfs_benchmark
+        PRIVATE low_latency_graphdb_storage)
+    find_package(Threads REQUIRED)
+    target_link_libraries(low_latency_graphdb_rocksdb_bfs_benchmark PRIVATE Threads::Threads)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(low_latency_graphdb_core_tests
@@ -77,4 +111,12 @@ if(BUILD_TESTING)
     add_test(NAME core COMMAND low_latency_graphdb_core_tests)
     add_test(NAME hot_node_correctness
         COMMAND low_latency_graphdb_hot_node_correctness_test)
+    if(LLG_ENABLE_ROCKSDB)
+        add_executable(low_latency_graphdb_rocksdb_tests tests/rocksdb_store_tests.cpp)
+        target_link_libraries(low_latency_graphdb_rocksdb_tests
+            PRIVATE low_latency_graphdb_storage)
+        find_package(Threads REQUIRED)
+        target_link_libraries(low_latency_graphdb_rocksdb_tests PRIVATE Threads::Threads)
+        add_test(NAME rocksdb_store COMMAND low_latency_graphdb_rocksdb_tests)
+    endif()
 endif()
