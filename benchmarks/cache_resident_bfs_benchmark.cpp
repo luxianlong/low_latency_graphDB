@@ -27,10 +27,15 @@ struct CacheResidentGraph {
         : nodes(node_count) {
         for (std::size_t source = 0; source < nodes.size(); ++source) {
             nodes[source].node_id = source;
-            nodes[source].count = kFanout;
-            for (std::uint32_t edge = 0; edge < kFanout; ++edge) {
+            const std::size_t first_child = source * kFanout + 1;
+            if (first_child >= nodes.size()) {
+                continue;
+            }
+            nodes[source].count = static_cast<std::uint32_t>(
+                std::min<std::size_t>(kFanout, nodes.size() - first_child));
+            for (std::uint32_t edge = 0; edge < nodes[source].count; ++edge) {
                 nodes[source].inline_neighbors[edge] =
-                    static_cast<LocalId>((source + edge + 1) % nodes.size());
+                    static_cast<LocalId>(first_child + edge);
             }
         }
     }
