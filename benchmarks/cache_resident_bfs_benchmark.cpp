@@ -1,5 +1,6 @@
 #include "low_latency_graphdb/graph_node_slab.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -83,6 +84,14 @@ struct TraversalState {
     }
 };
 
+std::uint64_t percentile(
+    const std::vector<std::uint64_t>& sorted_values,
+    std::size_t percent) {
+    const std::size_t index =
+        ((sorted_values.size() - 1) * percent) / 100;
+    return sorted_values[index];
+}
+
 #if defined(__clang__) || defined(__GNUC__)
 __attribute__((noinline))
 #endif
@@ -125,33 +134,48 @@ std::size_t run_query(
 
 int main(int argc, char** argv) {
     const std::size_t iterations =
-        argc > 1 ? std::stoull(argv[1]) : 10'000'000;
+        argc > 1 ? std::stoull(argv[1]) : 10'000;
     const std::size_t threads =
         argc > 2 ? std::stoull(argv[2]) : 1;
     const std::uint32_t depth =
         argc > 3 ? static_cast<std::uint32_t>(std::stoull(argv[3])) : 1;
     const std::size_t node_count =
         argc > 4 ? std::stoull(argv[4]) : 1'000'000;
-    if (iterations == 0 || threads == 0 || node_count == 0) {
-        std::cerr << "iterations, threads, and nodes must be positive\n";
+    const std::size_t batch_size =
+        argc > 5 ? std::stoull(argv[5]) : 64;
+    if (iterations == 0 || threads == 0 || node_count == 0 ||
+        batch_size == 0) {
+        std::cerr << "iterations, threads, nodes, and batch size must be positive\n";
         return EXIT_FAILURE;
     }
 
     const CacheResidentGraph graph(node_count);
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(threads + 1));
     std::vector<std::uint64_t> checksums(threads);
+    std::vector<std::vector<std::uint64_t>> thread_latencies(threads);
     std::vector<std::thread> workers;
     workers.reserve(threads);
 
     for (std::size_t thread = 0; thread < threads; ++thread) {
         workers.emplace_back([&, thread] {
             TraversalState state;
+            auto& latencies = thread_latencies[thread];
+            latencies.reserve(iterations);
             start_barrier.arrive_and_wait();
             std::uint64_t checksum = 0;
             for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
                 std::atomic_signal_fence(std::memory_order_acquire);
-                checksum += run_query(graph, state, 0, depth);
+                const auto query_started = Clock::now();
+                for (std::size_t query = 0; query < batch_size; ++query) {
+                    checksum += run_query(graph, state, 0, depth);
+                }
+                const auto query_finished = Clock::now();
                 std::atomic_signal_fence(std::memory_order_release);
+                latencies.push_back(static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        query_finished - query_started)
+                        .count() /
+                    batch_size));
             }
             checksums[thread] = checksum;
         });
@@ -170,8 +194,22 @@ int main(int argc, char** argv) {
             .count();
     const std::uint64_t checksum =
         std::accumulate(checksums.begin(), checksums.end(), std::uint64_t{0});
-    const std::size_t total_queries = iterations * threads;
-    const double ns_per_query =
+    const std::size_t total_queries = iterations * threads * batch_size;
+    std::vector<std::uint64_t> latencies;
+    latencies.reserve(total_queries);
+    for (auto& thread_latencies : thread_latencies) {
+        latencies.insert(
+            latencies.end(),
+            thread_latencies.begin(),
+            thread_latencies.end());
+    }
+    std::sort(latencies.begin(), latencies.end());
+    const std::uint64_t total_latency_ns =
+        std::accumulate(latencies.begin(), latencies.end(), std::uint64_t{0});
+    const double mean_latency_ns =
+        static_cast<double>(total_latency_ns) /
+        static_cast<double>(latencies.size());
+    const double wall_ns_per_query =
         static_cast<double>(elapsed_ns) / static_cast<double>(total_queries);
 
     std::cout     << "cache_graph_nodes=" << graph.nodes.size()
@@ -180,10 +218,16 @@ int main(int argc, char** argv) {
               << " fanout=" << kFanout
               << " depth=" << depth
               << " iterations=" << iterations
-              << " threads=" << threads << '\n';
+              << " threads=" << threads
+              << " queries_per_sample=" << batch_size << '\n';
     std::cout << std::fixed << std::setprecision(2)
-              << "wall_amortized_ns_per_query=" << ns_per_query
-              << " throughput_qps=" << 1'000'000'000.0 / ns_per_query
-              << " estimated_cycles_at_3GHz=" << ns_per_query * 3.0
+              << "request_latency_ns"
+              << " p50=" << percentile(latencies, 50)
+              << " p95=" << percentile(latencies, 95)
+              << " p99=" << percentile(latencies, 99)
+              << " max=" << latencies.back()
+              << " mean=" << mean_latency_ns
+              << " wall_amortized=" << wall_ns_per_query
+              << " throughput_qps=" << 1'000'000'000.0 / wall_ns_per_query
               << " checksum=" << checksum << '\n';
 }
