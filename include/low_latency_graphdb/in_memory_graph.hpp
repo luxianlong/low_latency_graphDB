@@ -29,7 +29,6 @@ public:
         const auto local_id = static_cast<LocalNodeId>(nodes_.size());
         index_by_id_.emplace(node_id, local_id);
         nodes_.emplace_back();
-        overflow_neighbors_.emplace_back();
         nodes_.back().node_id = node_id;
     }
 
@@ -48,15 +47,20 @@ public:
             node.inline_neighbors[node.count] = target_local;
         } else {
             if (!node.has_overflow()) {
-                node.overflow_index = source_local + 1;
+                node.overflow_index =
+                    static_cast<std::uint32_t>(overflow_storage_.size());
             }
-            overflow_neighbors_[source_local].push_back(target_local);
+            overflow_storage_.push_back(target_local);
         }
         ++node.count;
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
         return nodes_.size();
+    }
+
+    [[nodiscard]] std::size_t hot_node_storage_bytes() const noexcept {
+        return nodes_.size() * sizeof(GraphNodeSlab);
     }
 
     [[nodiscard]] LocalNodeId local_id(NodeId node_id) const {
@@ -83,8 +87,13 @@ public:
             visitor(node.inline_neighbors[i]);
         }
         if (node.has_overflow()) {
-            for (LocalNodeId neighbor : overflow_neighbors_[local_id]) {
-                visitor(neighbor);
+            const std::size_t first = node.overflow_index;
+            const std::size_t count = node.count - node.inline_neighbors.size();
+            if (first + count > overflow_storage_.size()) {
+                throw std::logic_error("InMemoryGraph: invalid overflow adjacency");
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                visitor(overflow_storage_[first + i]);
             }
         }
     }
@@ -92,7 +101,7 @@ public:
 private:
     std::unordered_map<NodeId, LocalNodeId> index_by_id_;
     std::vector<GraphNodeSlab> nodes_;
-    std::vector<std::vector<LocalNodeId>> overflow_neighbors_;
+    std::vector<LocalNodeId> overflow_storage_;
 };
 
 }  // namespace low_latency_graphdb

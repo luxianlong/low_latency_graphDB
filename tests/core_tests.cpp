@@ -129,6 +129,7 @@ void test_breadth_first_search() {
     const auto overflow_result =
         low_latency_graphdb::BreadthFirstSearch(high_degree).run(100, 1);
     require(overflow_result.visited.size() == 13);
+    require(high_degree.hot_node_storage_bytes() == 13 * sizeof(GraphNodeSlab));
 }
 
 }  // namespace
