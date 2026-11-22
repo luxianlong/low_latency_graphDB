@@ -18,7 +18,6 @@ namespace {
 
 constexpr std::size_t kNodeCount = 64;
 constexpr std::uint32_t kFanout = 8;
-constexpr std::uint32_t kDepth = 1;
 using Clock = std::chrono::steady_clock;
 using Node = low_latency_graphdb::GraphNodeSlab;
 using LocalId = low_latency_graphdb::LocalNodeId;
@@ -50,7 +49,8 @@ __attribute__((noinline))
 std::size_t run_query(
     const CacheResidentGraph& graph,
     TraversalState& state,
-    LocalId start) noexcept {
+    LocalId start,
+    std::uint32_t max_depth) noexcept {
     std::memset(state.visited.data(), 0, state.visited.size());
     state.queue[0] = start;
     state.depths[0] = 0;
@@ -64,7 +64,7 @@ std::size_t run_query(
         const std::uint32_t depth = state.depths[head];
         ++head;
         ++visited_count;
-        if (depth >= kDepth) {
+        if (depth >= max_depth) {
             continue;
         }
 
@@ -89,8 +89,10 @@ int main(int argc, char** argv) {
         argc > 1 ? std::stoull(argv[1]) : 10'000'000;
     const std::size_t threads =
         argc > 2 ? std::stoull(argv[2]) : 1;
-    if (iterations == 0 || threads == 0) {
-        std::cerr << "iterations and threads must be positive\n";
+    const std::uint32_t depth =
+        argc > 3 ? static_cast<std::uint32_t>(std::stoull(argv[3])) : 1;
+    if (iterations == 0 || threads == 0 || depth > kNodeCount) {
+        std::cerr << "iterations and threads must be positive; depth must fit the graph\n";
         return EXIT_FAILURE;
     }
 
@@ -107,7 +109,7 @@ int main(int argc, char** argv) {
             std::uint64_t checksum = 0;
             for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
                 std::atomic_signal_fence(std::memory_order_acquire);
-                checksum += run_query(graph, state, 0);
+                checksum += run_query(graph, state, 0, depth);
                 std::atomic_signal_fence(std::memory_order_release);
             }
             checksums[thread] = checksum;
@@ -135,7 +137,7 @@ int main(int argc, char** argv) {
               << " graph_bytes=" << sizeof(graph)
               << " node_bytes=" << sizeof(Node)
               << " fanout=" << kFanout
-              << " depth=" << kDepth
+              << " depth=" << depth
               << " iterations=" << iterations
               << " threads=" << threads << '\n';
     std::cout << std::fixed << std::setprecision(2)

@@ -80,9 +80,15 @@ For a real cache-resident BFS query with reusable queue and visited state:
 ./build/low_latency_graphdb_cache_resident_bfs_benchmark 10000000 1
 ```
 
-This uses a 64-node graph (4 KiB of slabs), fanout 8, depth 1, and measures
-repeated BFS queries without hash lookup, heap allocation, or result-vector
-construction in the timed loop.
+Arguments are `iterations`, `threads`, and optional `depth`. For example:
+
+```sh
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 10000000 1 3
+```
+
+This uses a 64-node graph (4 KiB of slabs), fanout 8, and measures repeated
+BFS queries without hash lookup, heap allocation, or result-vector construction
+in the timed loop.
 
 ## Test
 
