@@ -77,24 +77,51 @@ cmake --build build --target benchmark-cache-core
 For a real cache-resident BFS query with reusable queue and visited state:
 
 ```sh
-./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 2 1000000 64
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 2 10000000 64
 ```
 
 Arguments are `iterations`, `threads`, optional `depth`, optional node count,
-and optional queries-per-sample. Each latency sample times that many identical
+optional queries-per-sample, and optional hot-node count. Set `iterations` to `0` to select the
+depth-aware default. Each latency sample times that many identical
 requests and divides by the batch size to avoid timer-resolution distortion.
+When omitted, shallow cases use more samples and a batch of 64: depth 1 uses
+1,000,000 iterations, depth 2 uses 200,000, depth 5 uses 20,000, and depth 7
+uses 100. These defaults target roughly one second of query work per thread;
+the depth-7 five-thread case remains within the 3-second run-time budget.
+The standard comparison uses 1 thread and 5 threads; higher thread counts are
+not representative of the target workload on this machine.
 
 ```sh
-./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 3 1000000 64
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 5 2 10000000 64
 ```
 
-The canonical case is a 1,000,000-node graph (64 MiB of slabs) with unique
-tree children, fanout 8, and depth 2, visiting 73 nodes. Expected visited
-counts are 9, 73, and 585 at depths 1, 2, and 3. Reusable generation-stamped
-query state avoids clearing a million-entry bitmap between queries. Latency
-samples use `steady_clock` around batches of identical requests to avoid
-timer-resolution distortion; aggregate wall-time throughput is reported
-separately.
+```sh
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 3 10000000 64
+```
+
+The canonical graph is now 10,000,000 nodes (640 MiB of slabs) with unique
+tree children and fanout 8. Depths 5 and 7 are included to sweep from
+approximately 2.4 MiB to 146 MiB of active node data; depth 7 requires at
+least 2,396,745 reachable nodes. Reusable generation-stamped query state is
+allocated according to the selected depth. Latency samples use `steady_clock`
+around batches of identical requests to avoid timer-resolution distortion;
+aggregate wall-time throughput is reported separately.
+
+For the cache-size sweep:
+
+```sh
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 10 1 5 10000000 1
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 10 1 7 10000000 1
+```
+
+For the depth-2 hot-node sweep, the final argument selects the number of
+starting nodes used in a reproducible pseudo-random pattern:
+
+```sh
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 0 1 2 10000000 64 10
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 0 1 2 10000000 64 100
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 0 1 2 10000000 64 10000
+```
 
 ## Test
 

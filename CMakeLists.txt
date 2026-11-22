@@ -49,6 +49,13 @@ target_link_libraries(low_latency_graphdb_cache_resident_bfs_benchmark
     PRIVATE low_latency_graphdb_core
 )
 
+add_executable(low_latency_graphdb_hot_node_correctness_test
+    tests/hot_node_correctness.cpp
+)
+target_link_libraries(low_latency_graphdb_hot_node_correctness_test
+    PRIVATE low_latency_graphdb_core
+)
+
 add_custom_target(benchmark-cache-core
     COMMAND low_latency_graphdb_cache_core_benchmark 10000000 1
     DEPENDS low_latency_graphdb_cache_core_benchmark
@@ -68,4 +75,6 @@ if(BUILD_TESTING)
     )
     target_link_libraries(low_latency_graphdb_core_tests PRIVATE low_latency_graphdb_core)
     add_test(NAME core COMMAND low_latency_graphdb_core_tests)
+    add_test(NAME hot_node_correctness
+        COMMAND low_latency_graphdb_hot_node_correctness_test)
 endif()

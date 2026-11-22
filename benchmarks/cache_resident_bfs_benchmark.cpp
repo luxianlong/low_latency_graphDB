@@ -1,7 +1,6 @@
 #include "low_latency_graphdb/graph_node_slab.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -18,7 +17,6 @@
 namespace {
 
 constexpr std::uint32_t kFanout = 8;
-constexpr std::size_t kVisitedCapacity = 2048;
 using Clock = std::chrono::steady_clock;
 using Node = low_latency_graphdb::GraphNodeSlab;
 using LocalId = low_latency_graphdb::LocalNodeId;
@@ -50,10 +48,23 @@ struct TraversalState {
         std::uint32_t generation{0};
     };
 
-    std::array<LocalId, kVisitedCapacity> queue{};
-    std::array<std::uint32_t, kVisitedCapacity> depths{};
-    std::array<SeenEntry, kVisitedCapacity> seen{};
+    explicit TraversalState(std::size_t query_capacity)
+        : queue(query_capacity),
+          depths(query_capacity),
+          seen(next_power_of_two(query_capacity * 2)) {}
+
+    std::vector<LocalId> queue;
+    std::vector<std::uint32_t> depths;
+    std::vector<SeenEntry> seen;
     std::uint32_t generation{0};
+
+    static std::size_t next_power_of_two(std::size_t value) noexcept {
+        std::size_t result = 1;
+        while (result < value) {
+            result <<= 1;
+        }
+        return result;
+    }
 
     void begin_query() noexcept {
         ++generation;
@@ -66,9 +77,9 @@ struct TraversalState {
     }
 
     bool mark_seen(LocalId node) noexcept {
-        constexpr std::size_t mask = kVisitedCapacity - 1;
+        const std::size_t mask = seen.size() - 1;
         std::size_t slot = (static_cast<std::size_t>(node) * 2654435761U) & mask;
-        for (std::size_t probe = 0; probe < kVisitedCapacity; ++probe) {
+        for (std::size_t probe = 0; probe < seen.size(); ++probe) {
             auto& entry = seen[slot];
             if (entry.generation != generation) {
                 entry.node = node;
@@ -83,6 +94,26 @@ struct TraversalState {
         return false;
     }
 };
+
+std::size_t query_capacity(
+    std::size_t node_count,
+    std::uint32_t depth) noexcept {
+    std::size_t total = 0;
+    std::size_t level_nodes = 1;
+    for (std::uint32_t level = 0; level <= depth; ++level) {
+        if (level_nodes > node_count - total) {
+            return node_count;
+        }
+        total += level_nodes;
+        if (total == node_count || level == depth) {
+            break;
+        }
+        level_nodes = level_nodes > node_count / kFanout
+            ? node_count
+            : level_nodes * kFanout;
+    }
+    return total;
+}
 
 std::uint64_t percentile(
     const std::vector<std::uint64_t>& sorted_values,
@@ -130,26 +161,59 @@ std::size_t run_query(
     return visited_count;
 }
 
+std::size_t default_iterations(std::uint32_t depth) noexcept {
+    if (depth == 1) {
+        return 1'000'000;
+    }
+    if (depth == 2) {
+        return 200'000;
+    }
+    if (depth <= 5) {
+        return 20'000;
+    }
+    return 100;
+}
+
+std::size_t default_batch_size(std::uint32_t depth) noexcept {
+    return depth <= 2 ? 64 : 1;
+}
+
+std::uint64_t mix_hot_root(std::uint64_t value) noexcept {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::size_t iterations =
-        argc > 1 ? std::stoull(argv[1]) : 10'000;
     const std::size_t threads =
         argc > 2 ? std::stoull(argv[2]) : 1;
     const std::uint32_t depth =
         argc > 3 ? static_cast<std::uint32_t>(std::stoull(argv[3])) : 2;
+    const std::size_t requested_iterations =
+        argc > 1 ? std::stoull(argv[1]) : 0;
+    const std::size_t iterations =
+        requested_iterations == 0
+        ? default_iterations(depth)
+        : requested_iterations;
     const std::size_t node_count =
-        argc > 4 ? std::stoull(argv[4]) : 1'000'000;
+        argc > 4 ? std::stoull(argv[4]) : 10'000'000;
     const std::size_t batch_size =
-        argc > 5 ? std::stoull(argv[5]) : 64;
+        argc > 5 ? std::stoull(argv[5]) : default_batch_size(depth);
+    const std::size_t hot_node_count =
+        argc > 6 ? std::stoull(argv[6]) : 1;
     if (iterations == 0 || threads == 0 || node_count == 0 ||
-        batch_size == 0) {
-        std::cerr << "iterations, threads, nodes, and batch size must be positive\n";
+        batch_size == 0 || hot_node_count == 0 ||
+        hot_node_count > node_count) {
+        std::cerr << "iterations, threads, nodes, batch size, and hot nodes "
+                     "must be positive; hot nodes cannot exceed nodes\n";
         return EXIT_FAILURE;
     }
 
     const CacheResidentGraph graph(node_count);
+    const std::size_t capacity = query_capacity(node_count, depth);
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(threads + 1));
     std::vector<std::uint64_t> checksums(threads);
     std::vector<std::vector<std::uint64_t>> thread_latencies(threads);
@@ -158,7 +222,7 @@ int main(int argc, char** argv) {
 
     for (std::size_t thread = 0; thread < threads; ++thread) {
         workers.emplace_back([&, thread] {
-            TraversalState state;
+            TraversalState state(capacity);
             auto& latencies = thread_latencies[thread];
             latencies.reserve(iterations);
             start_barrier.arrive_and_wait();
@@ -167,7 +231,14 @@ int main(int argc, char** argv) {
                 std::atomic_signal_fence(std::memory_order_acquire);
                 const auto query_started = Clock::now();
                 for (std::size_t query = 0; query < batch_size; ++query) {
-                    checksum += run_query(graph, state, 0, depth);
+                    const std::size_t query_index =
+                        iteration * batch_size + query;
+                    const LocalId start = static_cast<LocalId>(
+                        mix_hot_root(
+                            query_index +
+                            thread * 0x9e3779b97f4a7c15ULL) %
+                        hot_node_count);
+                    checksum += run_query(graph, state, start, depth);
                 }
                 const auto query_finished = Clock::now();
                 std::atomic_signal_fence(std::memory_order_release);
@@ -217,6 +288,7 @@ int main(int argc, char** argv) {
               << " node_bytes=" << sizeof(Node)
               << " fanout=" << kFanout
               << " depth=" << depth
+              << " hot_nodes=" << hot_node_count
               << " iterations=" << iterations
               << " threads=" << threads
               << " queries_per_sample=" << batch_size << '\n';
