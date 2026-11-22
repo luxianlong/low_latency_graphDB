@@ -77,7 +77,7 @@ cmake --build build --target benchmark-cache-core
 For a real cache-resident BFS query with reusable queue and visited state:
 
 ```sh
-./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 1 1000000 64
+./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 2 1000000 64
 ```
 
 Arguments are `iterations`, `threads`, optional `depth`, optional node count,
@@ -88,12 +88,13 @@ requests and divides by the batch size to avoid timer-resolution distortion.
 ./build/low_latency_graphdb_cache_resident_bfs_benchmark 1000 1 3 1000000 64
 ```
 
-The default graph has 1,000,000 nodes (64 MiB of slabs) with unique tree
-children and fanout 8. Expected visited counts are 9, 73, and 585 at depths
-1, 2, and 3. Reusable generation-stamped query state avoids clearing a
-million-entry bitmap between queries. Latency samples use `steady_clock` around batches of identical
-requests to avoid timer-resolution distortion; aggregate wall-time throughput
-is reported separately.
+The canonical case is a 1,000,000-node graph (64 MiB of slabs) with unique
+tree children, fanout 8, and depth 2, visiting 73 nodes. Expected visited
+counts are 9, 73, and 585 at depths 1, 2, and 3. Reusable generation-stamped
+query state avoids clearing a million-entry bitmap between queries. Latency
+samples use `steady_clock` around batches of identical requests to avoid
+timer-resolution distortion; aggregate wall-time throughput is reported
+separately.
 
 ## Test
 

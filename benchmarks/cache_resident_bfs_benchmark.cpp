@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
     const std::size_t threads =
         argc > 2 ? std::stoull(argv[2]) : 1;
     const std::uint32_t depth =
-        argc > 3 ? static_cast<std::uint32_t>(std::stoull(argv[3])) : 1;
+        argc > 3 ? static_cast<std::uint32_t>(std::stoull(argv[3])) : 2;
     const std::size_t node_count =
         argc > 4 ? std::stoull(argv[4]) : 1'000'000;
     const std::size_t batch_size =
