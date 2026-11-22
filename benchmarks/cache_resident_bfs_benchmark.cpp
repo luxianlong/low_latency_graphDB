@@ -182,7 +182,8 @@ int main(int argc, char** argv) {
               << " iterations=" << iterations
               << " threads=" << threads << '\n';
     std::cout << std::fixed << std::setprecision(2)
-              << "query_latency_ns=" << ns_per_query
+              << "wall_amortized_ns_per_query=" << ns_per_query
+              << " throughput_qps=" << 1'000'000'000.0 / ns_per_query
               << " estimated_cycles_at_3GHz=" << ns_per_query * 3.0
               << " checksum=" << checksum << '\n';
 }
