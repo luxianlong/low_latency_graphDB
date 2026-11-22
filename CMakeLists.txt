@@ -42,6 +42,12 @@ target_link_libraries(low_latency_graphdb_cache_core_benchmark
     PRIVATE low_latency_graphdb_core
 )
 
+add_custom_target(benchmark-cache-core
+    COMMAND low_latency_graphdb_cache_core_benchmark 10000000 1
+    DEPENDS low_latency_graphdb_cache_core_benchmark
+    USES_TERMINAL
+)
+
 if(MSVC)
     target_compile_options(low_latency_graphdb_core INTERFACE /W4 /permissive-)
 else()

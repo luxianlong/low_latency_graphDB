@@ -31,6 +31,13 @@ a smoke test. The traversal engine can currently be used with
 
 ## Latency benchmark
 
+Correctness tests and performance tests have different purposes:
+
+- `ctest` verifies traversal behavior and safety.
+- `benchmark-cache-core` measures the cache-resident 64-byte hot path.
+- The full BFS and hot-node benchmarks include query lifecycle overhead and
+  are diagnostic workloads, not measurements of the cache-line target.
+
 Build and run the deterministic parallel benchmark:
 
 ```sh
@@ -60,6 +67,12 @@ To isolate the cache-resident 64-byte node scan itself:
 The first argument is scan iterations and the second is worker count. This
 benchmark intentionally excludes graph lookup, query allocation, result
 materialization, and thread scheduling inside each scan.
+
+The same benchmark can be run through CMake:
+
+```sh
+cmake --build build --target benchmark-cache-core
+```
 
 ## Test
 
