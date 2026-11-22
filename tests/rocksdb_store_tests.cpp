@@ -1,0 +1,296 @@
+#include "low_latency_graphdb/breadth_first_search.hpp"
+#include "low_latency_graphdb/rocksdb_graph_store.hpp"
+#include "low_latency_graphdb/storage_bfs.hpp"
+#include "low_latency_graphdb/tiered_graph.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace low_latency_graphdb;
+using namespace low_latency_graphdb::storage;
+
+namespace {
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::cerr << "FAILED: " << message << '\n';
+        std::abort();
+    }
+}
+
+void test_key_ordering() {
+    const auto a = encode_vertex_key(1);
+    const auto b = encode_vertex_key(256);
+    require(std::string(a.data(), a.size()) < std::string(b.data(), b.size()),
+            "big-endian keys sort numerically");
+    const auto edge = encode_edge_key(1, 2, 3);
+    require(edge.size() == 18, "edge key is 18 bytes");
+}
+
+void test_store(const std::string& path) {
+    {
+        RocksDbGraphStore store(path);
+        const std::vector<std::uint64_t> targets{2, 3, 4};
+        const std::vector<EdgeLightMeta> metas{{1, 10, 100}, {1, 20, 200}, {2, 30, 300}};
+        const std::vector<std::string> edge_payloads{"e2", "e3", "e4"};
+        store.write_adjacency(1, targets, metas, edge_payloads);
+        store.write_adjacency(2, std::vector<std::uint64_t>{4},
+                              std::vector<EdgeLightMeta>{{1, 1, 1}});
+        store.write_vertex_props(2, "v2");
+        store.write_vertex_props(4, "v4");
+
+        auto snapshot = store.snapshot();
+        store.write_vertex_props(3, "v3-after-snapshot");
+
+        RocksDbGraphStore::AdjacencyHandle handle;
+        require(store.read_adjacency(1, handle, &snapshot), "adjacency found");
+        require(handle.view().size() == 3, "degree");
+        require(handle.view().target(2) == 4, "target");
+        require(handle.view().meta(1).weight == 20, "meta");
+        require(!store.read_adjacency(99, handle), "missing adjacency");
+
+        const auto props = store.fetch_vertex_props({4, 2, 3, 2}, &snapshot);
+        require(props.size() == 3, "deduplicated");
+        require(props[0] == "v2" && props[1] == std::nullopt && props[2] == "v4",
+                "snapshot isolates later writes");
+
+        require(store.read_edge_props(1, 2, 4) == "e4", "edge props");
+        require(!store.read_edge_props(1, 1, 4).has_value(), "edge key includes type");
+
+        bool tripped = false;
+        try {
+            std::vector<std::uint64_t> many(RocksDbGraphStore::kMaxMaterializeBatchSize + 1);
+            for (std::size_t i = 0; i < many.size(); ++i) many[i] = i;
+            store.fetch_vertex_props(std::move(many));
+        } catch (const StorageError&) {
+            tripped = true;
+        }
+        require(tripped, "fan-out guard");
+        store.flush();
+    }
+
+    // Reopen: data persisted; warm the in-memory graph and traverse.
+    RocksDbGraphStore reopened(path);
+    InMemoryGraph graph;
+    reopened.load_into(graph);
+    const auto result = BreadthFirstSearch(graph).run(1, 2);
+    std::vector<NodeId> visited = result.visited;
+    std::sort(visited.begin(), visited.end());
+    require((visited == std::vector<NodeId>{1, 2, 3, 4}), "BFS over loaded graph");
+}
+
+void test_storage_bfs(const std::string& path) {
+    RocksDbGraphStore store(path);
+    // Tree with fanout 3 plus a back-edge and a self-loop.
+    constexpr std::uint64_t kNodes = 400;
+    InMemoryGraph reference;
+    for (std::uint64_t v = 0; v < kNodes; ++v) {
+        std::vector<std::uint64_t> targets;
+        for (std::uint64_t c = 3 * v + 1; c <= 3 * v + 3 && c < kNodes; ++c) {
+            targets.push_back(c);
+        }
+        if (v > 0) targets.push_back(v - 1);
+        if (v == 5) targets.push_back(5);
+        std::vector<EdgeLightMeta> metas(targets.size());
+        store.write_adjacency(v, targets, metas);
+        reference.add_vertex(v);
+        for (auto t : targets) reference.add_edge(v, t);
+    }
+    store.flush();
+
+    StorageBfsOptions options;
+    options.max_depth = 3;
+    options.pin_batch_size = 7;  // forces multiple chunks per level
+    StorageBreadthFirstSearch bfs(store);
+    StorageBfsStats stats;
+    (void)bfs.run(0, options, &stats);  // warm the block cache
+    const auto result = bfs.run(0, options, &stats);
+
+    auto expected = BreadthFirstSearch(reference).run(0, 3).visited;
+    auto actual = result.visited;
+    std::sort(expected.begin(), expected.end());
+    std::sort(actual.begin(), actual.end());
+    require(actual == expected, "storage BFS matches in-memory BFS");
+    require(stats.rows_pinned > 0, "adjacency rows are served from pinned pages");
+    require(stats.rows_fetched == stats.rows_pinned + stats.rows_copied, "stats add up");
+
+    // Concurrent readers sharing one store, plus a writer touching unrelated keys.
+    std::atomic<int> mismatches{0};
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (std::uint64_t v = 10'000; !stop.load(); ++v) {
+            store.write_adjacency(v, std::vector<std::uint64_t>{v + 1},
+                                  std::vector<EdgeLightMeta>(1));
+        }
+    });
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 8; ++t) {
+        readers.emplace_back([&] {
+            for (int i = 0; i < 50; ++i) {
+                auto got = bfs.run(0, options).visited;
+                std::sort(got.begin(), got.end());
+                if (got != expected) ++mismatches;
+            }
+        });
+    }
+    for (auto& r : readers) r.join();
+    stop = true;
+    writer.join();
+    require(mismatches == 0, "concurrent storage BFS is consistent");
+
+    bool tripped = false;
+    options.max_visited = 10;
+    try {
+        (void)bfs.run(0, options);
+    } catch (const StorageError&) {
+        tripped = true;
+    }
+    require(tripped, "BFS visited guard");
+
+    RocksDbGraphStore::AdjacencyBatch batch;
+    bool rejected = false;
+    try {
+        const std::vector<std::uint64_t> unsorted{2, 1};
+        store.read_adjacency_batch(unsorted, batch);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "unsorted batch rejected");
+}
+
+std::vector<NodeId> sorted_ids(std::vector<NodeId> ids) {
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+void test_tiered_graph(const std::string& path) {
+    RocksDbGraphStore store(path);
+    constexpr std::uint64_t kNodes = 500;
+    InMemoryGraph reference;
+    for (std::uint64_t v = 0; v < kNodes; ++v) {
+        std::vector<std::uint64_t> targets;
+        // Degree 15 for v % 50 == 0 exercises slab overflow (inline holds 11).
+        const std::uint64_t fan = v % 50 == 0 ? 15 : 3;
+        for (std::uint64_t c = fan * v + 1; c <= fan * v + fan && c < kNodes; ++c) {
+            targets.push_back(c);
+        }
+        if (v > 0) targets.push_back(v / 3);
+        std::vector<EdgeLightMeta> metas(targets.size());
+        store.write_adjacency(v, targets, metas);
+        reference.add_vertex(v);
+        for (auto t : targets) reference.add_edge(v, t);
+    }
+    store.flush();
+
+    TieredGraph graph(store);
+    TieredBfsState state;
+    TieredBfsOptions options;
+    options.pin_batch_size = 5;
+
+    auto check_all = [&](const char* label) {
+        for (std::size_t depth : {0u, 1u, 2u, 4u}) {
+            options.max_depth = depth;
+            for (NodeId start : {0ull, 1ull, 7ull, 50ull, 499ull}) {
+                auto expected = sorted_ids(BreadthFirstSearch(reference).run(start, depth).visited);
+                std::vector<NodeId> got;
+                const std::size_t count = graph.run(start, options, state, &got);
+                if (sorted_ids(got) != expected || count != expected.size() ||
+                    graph.run(start, options, state) != expected.size()) {
+                    std::cerr << "mismatch: " << label << " start=" << start
+                              << " depth=" << depth << '\n';
+                    require(false, "tiered BFS matches in-memory BFS");
+                }
+            }
+        }
+    };
+
+    check_all("cold only");
+    graph.warm_top_degree(40);
+    require(graph.hot_tier()->stats().hot_nodes == 40, "hot set size");
+    require(graph.hot_tier()->stats().overflow_edges > 0, "overflow edges stored");
+    check_all("partial hot");
+    TieredBfsStats stats;
+    options.max_depth = 2;
+    (void)graph.run(0, options, state, nullptr, &stats);
+    require(stats.hot_rows > 0, "hot rows served from memory");
+    graph.warm_top_degree(kNodes);
+    check_all("all hot");
+    (void)graph.run(0, options, state, nullptr, &stats);
+    require(stats.cold_rows == 0, "fully hot query never reads RocksDB");
+
+    // A write to a hot vertex is visible immediately and invalidates its copy.
+    graph.write_adjacency(0, std::vector<std::uint64_t>{499},
+                          std::vector<EdgeLightMeta>(1));
+    options.max_depth = 1;
+    std::vector<NodeId> got;
+    graph.run(0, options, state, &got);
+    require(sorted_ids(got) == (std::vector<NodeId>{0, 499}), "write visible via cold path");
+    (void)graph.run(0, options, state, nullptr, &stats);
+    require(stats.cold_rows == 1, "dirty vertex is read from RocksDB");
+
+    // Rebuilding picks the new row up again.
+    graph.warm_top_degree(kNodes);
+    (void)graph.run(0, options, state, nullptr, &stats);
+    require(stats.cold_rows == 0, "refresh clears invalidation");
+
+    // Restore vertex 0 so the reference graph is valid again.
+    std::vector<std::uint64_t> original_targets;
+    for (std::uint64_t c = 1; c <= 15; ++c) original_targets.push_back(c);
+    graph.write_adjacency(0, original_targets,
+                          std::vector<EdgeLightMeta>(original_targets.size()));
+    graph.warm_top_degree(kNodes);
+
+    // Concurrent readers, a writer on a disjoint vertex range, and refreshes.
+    std::atomic<bool> stop{false};
+    std::atomic<int> bad{0};
+    std::thread writer([&] {
+        for (std::uint64_t v = 100'000; !stop.load(); ++v) {
+            graph.write_adjacency(v, std::vector<std::uint64_t>{v + 1},
+                                  std::vector<EdgeLightMeta>(1));
+        }
+    });
+    std::thread refresher([&] {
+        for (int i = 0; i < 20; ++i) {
+            graph.warm_top_degree(i % 2 == 0 ? 10 : 200);
+        }
+    });
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 6; ++t) {
+        readers.emplace_back([&] {
+            TieredBfsState local_state;
+            TieredBfsOptions local_options;
+            local_options.max_depth = 3;
+            const auto expected = BreadthFirstSearch(reference).run(7, 3).visited.size();
+            for (int i = 0; i < 300; ++i) {
+                if (graph.run(7, local_options, local_state) != expected) ++bad;
+            }
+        });
+    }
+    for (auto& r : readers) r.join();
+    refresher.join();
+    stop = true;
+    writer.join();
+    require(bad == 0, "concurrent tiered BFS is consistent");
+}
+
+}  // namespace
+
+int main() {
+    const auto path = std::filesystem::temp_directory_path() / "llg_rocksdb_store_test";
+    std::filesystem::remove_all(path);
+    test_key_ordering();
+    test_store(path.string());
+    std::filesystem::remove_all(path);
+    test_storage_bfs(path.string());
+    std::filesystem::remove_all(path);
+    test_tiered_graph(path.string());
+    std::filesystem::remove_all(path);
+    std::cout << "rocksdb store tests passed\n";
+    return 0;
+}

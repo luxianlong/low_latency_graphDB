@@ -82,7 +82,7 @@ void test_adjacency_view() {
     require(view.size() == 2);
     require(view.target(0) == 101);
     require(view.target(1) == 202);
-    require(view.edge_metas()[1].edge_type == 8);
+    require(view.meta(1).edge_type == 8);
 
     bool bounds_failed = false;
     try {
