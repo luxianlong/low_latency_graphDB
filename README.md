@@ -2,6 +2,10 @@
 
 A low-latency graph database implemented in C++.
 
+The current core includes a bounded query arena, a cache-line-sized hot-node
+slab, and a bounds-checked adjacency view. RocksDB integration will be added
+after the canonical storage schema is stabilized.
+
 ## Requirements
 
 - CMake 3.20 or newer
