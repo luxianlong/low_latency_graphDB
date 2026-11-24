@@ -1,21 +1,46 @@
 #include "low_latency_graphdb/storage/rocksdb_graph_store.hpp"
 #include "low_latency_graphdb/storage/storage_bfs.hpp"
 #include "low_latency_graphdb/storage/tiered_graph.hpp"
-#include "low_latency_graphdb/testing/breadth_first_search.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace low_latency_graphdb;
 using namespace low_latency_graphdb::storage;
 
 namespace {
+
+using AdjMap = std::unordered_map<NodeId, std::vector<NodeId>>;
+
+std::vector<NodeId> reference_bfs(const AdjMap& adj, NodeId start, std::size_t max_depth) {
+    std::vector<NodeId> visited;
+    std::unordered_set<NodeId> seen{start};
+    std::queue<std::pair<NodeId, std::size_t>> q;
+    q.emplace(start, 0);
+    while (!q.empty()) {
+        const auto [u, depth] = q.front();
+        q.pop();
+        visited.push_back(u);
+        if (depth >= max_depth) continue;
+        if (const auto it = adj.find(u); it != adj.end()) {
+            for (const NodeId v : it->second) {
+                if (seen.insert(v).second) {
+                    q.emplace(v, depth + 1);
+                }
+            }
+        }
+    }
+    return visited;
+}
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -75,21 +100,21 @@ void test_store(const std::string& path) {
         store.flush();
     }
 
-    // Reopen: data persisted; warm the in-memory graph and traverse.
+    // Reopen: data persisted and traversable directly via StorageBreadthFirstSearch.
     RocksDbGraphStore reopened(path);
-    InMemoryGraph graph;
-    reopened.load_into(graph);
-    const auto result = BreadthFirstSearch(graph).run(1, 2);
+    StorageBfsOptions reopen_opts;
+    reopen_opts.max_depth = 2;
+    const auto result = StorageBreadthFirstSearch(reopened).run(1, reopen_opts);
     std::vector<NodeId> visited = result.visited;
     std::sort(visited.begin(), visited.end());
-    require((visited == std::vector<NodeId>{1, 2, 3, 4}), "BFS over loaded graph");
+    require((visited == std::vector<NodeId>{1, 2, 3, 4}), "BFS over reopened store");
 }
 
 void test_storage_bfs(const std::string& path) {
     RocksDbGraphStore store(path);
     // Tree with fanout 3 plus a back-edge and a self-loop.
     constexpr std::uint64_t kNodes = 400;
-    InMemoryGraph reference;
+    AdjMap reference;
     for (std::uint64_t v = 0; v < kNodes; ++v) {
         std::vector<std::uint64_t> targets;
         for (std::uint64_t c = 3 * v + 1; c <= 3 * v + 3 && c < kNodes; ++c) {
@@ -99,8 +124,7 @@ void test_storage_bfs(const std::string& path) {
         if (v == 5) targets.push_back(5);
         std::vector<EdgeLightMeta> metas(targets.size());
         store.write_adjacency(v, targets, metas);
-        reference.add_vertex(v);
-        for (auto t : targets) reference.add_edge(v, t);
+        reference[v] = targets;
     }
     store.flush();
 
@@ -112,11 +136,11 @@ void test_storage_bfs(const std::string& path) {
     (void)bfs.run(0, options, &stats);  // warm the block cache
     const auto result = bfs.run(0, options, &stats);
 
-    auto expected = BreadthFirstSearch(reference).run(0, 3).visited;
+    auto expected = reference_bfs(reference, 0, 3);
     auto actual = result.visited;
     std::sort(expected.begin(), expected.end());
     std::sort(actual.begin(), actual.end());
-    require(actual == expected, "storage BFS matches in-memory BFS");
+    require(actual == expected, "storage BFS matches reference BFS");
     require(stats.rows_pinned > 0, "adjacency rows are served from pinned pages");
     require(stats.rows_fetched == stats.rows_pinned + stats.rows_copied, "stats add up");
 
@@ -172,7 +196,7 @@ std::vector<NodeId> sorted_ids(std::vector<NodeId> ids) {
 void test_tiered_graph(const std::string& path) {
     RocksDbGraphStore store(path);
     constexpr std::uint64_t kNodes = 500;
-    InMemoryGraph reference;
+    AdjMap reference;
     for (std::uint64_t v = 0; v < kNodes; ++v) {
         std::vector<std::uint64_t> targets;
         // Degree 15 for v % 50 == 0 exercises slab overflow (inline holds 11).
@@ -183,8 +207,7 @@ void test_tiered_graph(const std::string& path) {
         if (v > 0) targets.push_back(v / 3);
         std::vector<EdgeLightMeta> metas(targets.size());
         store.write_adjacency(v, targets, metas);
-        reference.add_vertex(v);
-        for (auto t : targets) reference.add_edge(v, t);
+        reference[v] = targets;
     }
     store.flush();
 
@@ -197,14 +220,14 @@ void test_tiered_graph(const std::string& path) {
         for (std::size_t depth : {0u, 1u, 2u, 4u}) {
             options.max_depth = depth;
             for (NodeId start : {0ull, 1ull, 7ull, 50ull, 499ull}) {
-                auto expected = sorted_ids(BreadthFirstSearch(reference).run(start, depth).visited);
+                auto expected = sorted_ids(reference_bfs(reference, start, depth));
                 std::vector<NodeId> got;
                 const std::size_t count = graph.run(start, options, state, &got);
                 if (sorted_ids(got) != expected || count != expected.size() ||
                     graph.run(start, options, state) != expected.size()) {
                     std::cerr << "mismatch: " << label << " start=" << start
                               << " depth=" << depth << '\n';
-                    require(false, "tiered BFS matches in-memory BFS");
+                    require(false, "tiered BFS matches reference BFS");
                 }
             }
         }
@@ -248,8 +271,7 @@ void test_tiered_graph(const std::string& path) {
         options.max_depth = 3;
         std::vector<NodeId> small_got;
         (void)small_graph.run(0, options, small_state, &small_got);
-        require(sorted_ids(small_got) ==
-                    sorted_ids(BreadthFirstSearch(reference).run(0, 3).visited),
+        require(sorted_ids(small_got) == sorted_ids(reference_bfs(reference, 0, 3)),
                 "small slab pool falls back cleanly when capacity is reached");
     }
 
@@ -275,7 +297,7 @@ void test_tiered_graph(const std::string& path) {
             TieredBfsState local_state;
             TieredBfsOptions local_options;
             local_options.max_depth = 3;
-            const auto expected = BreadthFirstSearch(reference).run(7, 3).visited.size();
+            const auto expected = reference_bfs(reference, 7, 3).size();
             for (int i = 0; i < 300; ++i) {
                 if (graph.run(7, local_options, local_state) != expected) ++bad;
             }

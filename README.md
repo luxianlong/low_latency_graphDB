@@ -206,7 +206,7 @@ Three test suites are registered with CTest:
 
 | Suite | Binary | What it checks |
 |---|---|---|
-| `core` | `low_latency_graphdb_core_tests` | `QueryArena` (64B align, hard quota, `ArenaScope`, `ArenaAllocator`), `FixedSlabPool` (`SlabSlot` free-list, 3-bucket EBR retire/reclaim, concurrent `EpochTracker` stress), `ZeroCopyAdjView`, `InMemoryGraph`, `BreadthFirstSearch` |
+| `core` | `low_latency_graphdb_core_tests` | `QueryArena` (64B align, hard quota, `ArenaScope`, `ArenaAllocator`), `FixedSlabPool` (`SlabSlot` free-list, 3-bucket EBR retire/reclaim, concurrent `EpochTracker` stress), `ZeroCopyAdjView` |
 | `hot_node_correctness` | `low_latency_graphdb_hot_node_correctness_test` | Hot-node traversal correctness across multiple hot-set sizes |
 | `rocksdb_store` | `low_latency_graphdb_rocksdb_tests` | `RocksDbGraphStore`, `StorageBreadthFirstSearch`, `TieredGraph` read-through loading, live COW + EBR updates, small-pool fallback, concurrent readers/writers, and arena quota enforcement |
 
@@ -235,13 +235,6 @@ Measures in-memory BFS latency with reusable queue and visited state on a 10 M-n
 ```
 
 **Arguments:** `<iterations> <threads> [depth] [node_count] [queries_per_sample] [hot_node_count]` (`iterations=0` selects depth-aware defaults).
-
-### Hot-node & full-graph latency benchmarks
-
-```sh
-./build/low_latency_graphdb_hot_node_benchmark --degree 8 --queries 2000 --threads 4
-./build/low_latency_graphdb_latency_benchmark --nodes 100000 --degree 8 --queries 1000 --depth 3 --threads 4
-```
 
 ### RocksDB & Read-Through Tiered BFS benchmark
 
@@ -283,22 +276,17 @@ low_latency_graphDB/
 │   ├── graph_node_slab.hpp           # Core: 64B GraphNodeSlab, SlabSlot free-list, FixedSlabPool + EBR EpochTracker
 │   ├── generation_set.hpp            # Core: O(1)-clear GenerationSet & DenseStampSet
 │   ├── adjacency_view.hpp            # Core: zero-copy adjacency decoder (ZeroCopyAdjView)
-│   ├── storage/                      # RocksDB integration & tiered engine
-│   │   ├── storage_codec.hpp         # Big-endian key/value codec for RocksDB
-│   │   ├── rocksdb_graph_store.hpp   # RocksDB store: 3 column families, PinnableSlice MultiGet
-│   │   ├── storage_bfs.hpp           # Level-synchronous BFS over RocksDB
-│   │   ├── hot_tier.hpp              # Live read-through HotTier backed by FixedSlabPool + EBR
-│   │   └── tiered_graph.hpp          # TieredGraph: one-direction QueryArena BFS + read-through + COW writes
-│   └── testing/                      # Reference / test-only in-memory graph & oracle BFS
-│       ├── in_memory_graph.hpp       # InMemoryGraph (test oracle & baseline)
-│       └── breadth_first_search.hpp  # Arena-backed BFS over InMemoryGraph
+│   └── storage/                      # RocksDB integration & tiered engine
+│       ├── storage_codec.hpp         # Big-endian key/value codec for RocksDB
+│       ├── rocksdb_graph_store.hpp   # RocksDB store: 3 column families, PinnableSlice MultiGet
+│       ├── storage_bfs.hpp           # Level-synchronous BFS over RocksDB
+│       ├── hot_tier.hpp              # Live read-through HotTier backed by FixedSlabPool + EBR
+│       └── tiered_graph.hpp          # TieredGraph: one-direction QueryArena BFS + read-through + COW writes
 ├── src/
-│   └── main.cpp                  # Smoke-test entry point
+│   └── main.cpp                      # RocksDB + TieredGraph demo entry point
 ├── benchmarks/
 │   ├── cache_core_benchmark.cpp
 │   ├── cache_resident_bfs_benchmark.cpp
-│   ├── hot_node_benchmark.cpp
-│   ├── latency_benchmark.cpp
 │   └── rocksdb_bfs_benchmark.cpp
 ├── tests/
 │   ├── core_tests.cpp

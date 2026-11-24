@@ -353,17 +353,6 @@ public:
         check(it->status(), "iterate cf_topo");
     }
 
-    // Loads every cf_topo row into any graph providing add_vertex/add_edge.
-    template <typename Graph>
-    void load_into(Graph& graph) {
-        for_each_adjacency([&](std::uint64_t src, const ZeroCopyAdjView& view) {
-            graph.add_vertex(src);
-            for (std::size_t i = 0; i < view.size(); ++i) {
-                graph.add_edge(src, view.target(i));
-            }
-        });
-    }
-
     void flush() {
         rocksdb::FlushOptions options;
         for (auto* cf : {topo_cf_, vertex_props_cf_, edge_props_cf_}) {

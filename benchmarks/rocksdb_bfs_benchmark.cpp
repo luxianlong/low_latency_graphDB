@@ -21,7 +21,6 @@
 // same graph is measured as a baseline.
 #include "low_latency_graphdb/storage/storage_bfs.hpp"
 #include "low_latency_graphdb/storage/tiered_graph.hpp"
-#include "low_latency_graphdb/testing/breadth_first_search.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -331,18 +330,6 @@ int main(int argc, char** argv) {
                   << " loaded / " << tier_stats.registered_nodes << " registered / "
                   << tier_stats.pool_capacity << " slots, " << std::fixed << std::setprecision(1)
                   << tier_stats.bytes / 1048576.0 << " MiB\n";
-    }
-
-    if (config.baseline) {
-        InMemoryGraph graph;
-        store.load_into(graph);
-        const BreadthFirstSearch memory_bfs(graph);
-        for (const std::size_t threads : config.threads) {
-            auto [samples, wall] = run_threads(config, threads, [&](std::uint64_t start, Sample& s) {
-                s.visited += memory_bfs.run(start, config.depth).visited.size();
-            });
-            print_row("in-memory", threads, summarize(merge(samples), wall, config.batch), "");
-        }
     }
 
     if (temp && !config.keep) {
