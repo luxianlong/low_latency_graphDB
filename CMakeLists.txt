@@ -94,12 +94,14 @@ if(LLG_ENABLE_ROCKSDB)
     add_library(low_latency_graphdb_storage INTERFACE)
     target_link_libraries(low_latency_graphdb_storage
         INTERFACE low_latency_graphdb_core ${LLG_ROCKSDB_TARGET})
+    find_package(Threads REQUIRED)
+    target_link_libraries(low_latency_graphdb
+        PRIVATE low_latency_graphdb_storage Threads::Threads)
+    target_compile_definitions(low_latency_graphdb PRIVATE LLG_ENABLE_ROCKSDB=1)
     add_executable(low_latency_graphdb_rocksdb_bfs_benchmark
         benchmarks/rocksdb_bfs_benchmark.cpp)
     target_link_libraries(low_latency_graphdb_rocksdb_bfs_benchmark
-        PRIVATE low_latency_graphdb_storage)
-    find_package(Threads REQUIRED)
-    target_link_libraries(low_latency_graphdb_rocksdb_bfs_benchmark PRIVATE Threads::Threads)
+        PRIVATE low_latency_graphdb_storage Threads::Threads)
 endif()
 
 include(CTest)

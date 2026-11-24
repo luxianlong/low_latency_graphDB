@@ -189,10 +189,10 @@ cmake --build build
 ## Run
 
 ```sh
-./build/low_latency_graphdb
+./build/low_latency_graphdb [optional_db_path]
 ```
 
-Builds a small in-memory graph and runs a depth-2 BFS as a smoke test, printing the arena capacity, hot-node pool capacity, and visited node count.
+Opens a `RocksDbGraphStore` fronted by `TieredGraph` (read-through `FixedSlabPool` + EBR + per-thread `QueryArena`), writes a small graph, runs a read-through BFS, a cached hot BFS, a live COW update, and late-materialized property lookup (cleaning up its temporary DB when no path is given).
 
 ---
 
