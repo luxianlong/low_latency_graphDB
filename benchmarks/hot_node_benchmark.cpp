@@ -1,4 +1,4 @@
-#include "low_latency_graphdb/breadth_first_search.hpp"
+#include "low_latency_graphdb/testing/breadth_first_search.hpp"
 
 #include <algorithm>
 #include <atomic>

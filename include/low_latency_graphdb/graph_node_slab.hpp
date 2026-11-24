@@ -20,6 +20,10 @@ namespace low_latency_graphdb {
 using NodeId = std::uint64_t;
 using LocalNodeId = std::uint32_t;
 
+struct TraversalResult {
+    std::vector<NodeId> visited;
+};
+
 struct alignas(64) GraphNodeSlab {
     NodeId node_id{0};
     std::uint32_t count{0};

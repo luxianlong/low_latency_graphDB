@@ -12,13 +12,13 @@ The core is built around four hardware-aware primitives — a per-query single-c
 flowchart TB
     Q[Query: start vertex, max_depth] --> BFS
 
-    subgraph TG[TieredGraph - tiered_graph.hpp]
+    subgraph TG[TieredGraph - storage/tiered_graph.hpp]
         BFS[Level-synchronous BFS<br/>one-direction raw QueryArena queue<br/>EpochTracker::ReadGuard]
         VIS[Visited sets<br/>DenseStampSet: LocalNodeId<br/>GenerationSet: overflow fallback]
         BFS --- VIS
     end
 
-    subgraph T1[Tier 1: HotTier - read-through, hot_tier.hpp]
+    subgraph T1[Tier 1: HotTier - read-through, storage/hot_tier.hpp]
         SL[FixedSlabPool: 64B SlabSlot intrusive free-list<br/>atomic directory_ + 3-bucket EBR reclamation]
         MAP[Lock-free flat NodeId to LocalNodeId map]
         OVF[Segmented EBR-reclaimed overflow neighbor arrays]
@@ -279,17 +279,19 @@ Builds a deterministic tree, bulk-loads and reopens RocksDB, warms the RocksDB b
 ```
 low_latency_graphDB/
 ├── include/low_latency_graphdb/
-│   ├── query_arena.hpp           # Single-chunk 16 MiB bump arena, ArenaScope, ArenaAllocator
-│   ├── graph_node_slab.hpp       # 64B GraphNodeSlab, SlabSlot free-list, FixedSlabPool + EBR EpochTracker
-│   ├── generation_set.hpp        # O(1)-clear GenerationSet & DenseStampSet
-│   ├── adjacency_view.hpp        # Zero-copy adjacency decoder (ZeroCopyAdjView)
-│   ├── storage_codec.hpp         # Big-endian key/value codec for RocksDB
-│   ├── in_memory_graph.hpp       # Reference in-memory graph (used as test oracle & baseline)
-│   ├── breadth_first_search.hpp  # Arena-backed BFS over InMemoryGraph
-│   ├── rocksdb_graph_store.hpp   # RocksDB store: 3 column families, PinnableSlice MultiGet
-│   ├── storage_bfs.hpp           # Level-synchronous BFS over RocksDB
-│   ├── hot_tier.hpp              # Live read-through HotTier backed by FixedSlabPool + EBR
-│   └── tiered_graph.hpp          # TieredGraph: one-direction QueryArena BFS + read-through + COW writes
+│   ├── query_arena.hpp               # Core: single-chunk 16 MiB bump arena, ArenaScope, ArenaAllocator
+│   ├── graph_node_slab.hpp           # Core: 64B GraphNodeSlab, SlabSlot free-list, FixedSlabPool + EBR EpochTracker
+│   ├── generation_set.hpp            # Core: O(1)-clear GenerationSet & DenseStampSet
+│   ├── adjacency_view.hpp            # Core: zero-copy adjacency decoder (ZeroCopyAdjView)
+│   ├── storage/                      # RocksDB integration & tiered engine
+│   │   ├── storage_codec.hpp         # Big-endian key/value codec for RocksDB
+│   │   ├── rocksdb_graph_store.hpp   # RocksDB store: 3 column families, PinnableSlice MultiGet
+│   │   ├── storage_bfs.hpp           # Level-synchronous BFS over RocksDB
+│   │   ├── hot_tier.hpp              # Live read-through HotTier backed by FixedSlabPool + EBR
+│   │   └── tiered_graph.hpp          # TieredGraph: one-direction QueryArena BFS + read-through + COW writes
+│   └── testing/                      # Reference / test-only in-memory graph & oracle BFS
+│       ├── in_memory_graph.hpp       # InMemoryGraph (test oracle & baseline)
+│       └── breadth_first_search.hpp  # Arena-backed BFS over InMemoryGraph
 ├── src/
 │   └── main.cpp                  # Smoke-test entry point
 ├── benchmarks/

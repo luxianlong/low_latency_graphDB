@@ -1,8 +1,8 @@
 #include "low_latency_graphdb/adjacency_view.hpp"
-#include "low_latency_graphdb/breadth_first_search.hpp"
 #include "low_latency_graphdb/graph_node_slab.hpp"
-#include "low_latency_graphdb/in_memory_graph.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
+#include "low_latency_graphdb/testing/breadth_first_search.hpp"
+#include "low_latency_graphdb/testing/in_memory_graph.hpp"
 
 #include <algorithm>
 #include <atomic>

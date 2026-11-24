@@ -2,7 +2,7 @@
 
 #include "low_latency_graphdb/adjacency_view.hpp"
 #include "low_latency_graphdb/graph_node_slab.hpp"
-#include "low_latency_graphdb/rocksdb_graph_store.hpp"
+#include "low_latency_graphdb/storage/rocksdb_graph_store.hpp"
 
 #include <algorithm>
 #include <array>

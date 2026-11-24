@@ -1,6 +1,6 @@
-#include "low_latency_graphdb/breadth_first_search.hpp"
 #include "low_latency_graphdb/graph_node_slab.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
+#include "low_latency_graphdb/testing/breadth_first_search.hpp"
 
 #include <iostream>
 

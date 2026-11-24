@@ -1,9 +1,9 @@
 #pragma once
 
 #include "low_latency_graphdb/generation_set.hpp"
-#include "low_latency_graphdb/hot_tier.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
-#include "low_latency_graphdb/storage_bfs.hpp"
+#include "low_latency_graphdb/storage/hot_tier.hpp"
+#include "low_latency_graphdb/storage/storage_bfs.hpp"
 
 #include <algorithm>
 #include <cstddef>

@@ -1,8 +1,7 @@
 #pragma once
 
 #include "low_latency_graphdb/adjacency_view.hpp"
-#include "low_latency_graphdb/in_memory_graph.hpp"
-#include "low_latency_graphdb/storage_codec.hpp"
+#include "low_latency_graphdb/storage/storage_codec.hpp"
 
 #include <rocksdb/convenience.h>
 #include <rocksdb/db.h>
@@ -354,8 +353,9 @@ public:
         check(it->status(), "iterate cf_topo");
     }
 
-    // Warms an in-memory graph from every cf_topo row.
-    void load_into(InMemoryGraph& graph) {
+    // Loads every cf_topo row into any graph providing add_vertex/add_edge.
+    template <typename Graph>
+    void load_into(Graph& graph) {
         for_each_adjacency([&](std::uint64_t src, const ZeroCopyAdjView& view) {
             graph.add_vertex(src);
             for (std::size_t i = 0; i < view.size(); ++i) {

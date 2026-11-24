@@ -1,7 +1,7 @@
-#include "low_latency_graphdb/breadth_first_search.hpp"
-#include "low_latency_graphdb/rocksdb_graph_store.hpp"
-#include "low_latency_graphdb/storage_bfs.hpp"
-#include "low_latency_graphdb/tiered_graph.hpp"
+#include "low_latency_graphdb/storage/rocksdb_graph_store.hpp"
+#include "low_latency_graphdb/storage/storage_bfs.hpp"
+#include "low_latency_graphdb/storage/tiered_graph.hpp"
+#include "low_latency_graphdb/testing/breadth_first_search.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -304,6 +304,69 @@ void test_tiered_graph(const std::string& path) {
             "arena resets cleanly after quota failure");
 }
 
+void test_write_update_visibility(const std::string& path) {
+    constexpr NodeId a = 1;
+    constexpr NodeId b = 2;
+    constexpr NodeId c = 3;
+
+    auto query_neighbors = [](const TieredGraph& graph, TieredBfsState& state,
+                              TieredBfsStats& stats) {
+        TieredBfsOptions opts;
+        opts.max_depth = 1;
+        std::vector<NodeId> visited;
+        const std::size_t count = graph.run(a, opts, state, &visited, &stats);
+        require(count == visited.size(), "visited count matches output size");
+        return sorted_ids(std::move(visited));
+    };
+
+    {
+        RocksDbGraphStore store(path);
+        TieredGraph graph(store, 64);
+        TieredBfsState state;
+        TieredBfsStats stats;
+
+        // 1. Write a -> b
+        graph.write_adjacency(a, std::vector<NodeId>{b}, std::vector<EdgeLightMeta>(1));
+        require(query_neighbors(graph, state, stats) == (std::vector<NodeId>{a, b}),
+                "step 1 (first query): a -> b");
+        require(stats.cold_rows == 1 && stats.hot_rows == 0,
+                "step 1: first query loads a on demand from RocksDB");
+        require(query_neighbors(graph, state, stats) == (std::vector<NodeId>{a, b}),
+                "step 1 (cached query): a -> b");
+        require(stats.hot_rows == 1 && stats.cold_rows == 0,
+                "step 1: second query hits FixedSlabPool");
+
+        // 2. Update to a -> b, a -> c
+        graph.write_adjacency(a, std::vector<NodeId>{b, c}, std::vector<EdgeLightMeta>(2));
+        require(query_neighbors(graph, state, stats) == (std::vector<NodeId>{a, b, c}),
+                "step 2: updated to a -> b, a -> c");
+        require(stats.hot_rows == 1 && stats.cold_rows == 0,
+                "step 2: COW update keeps a hot without RocksDB fallback");
+
+        // 3. Update to a -> c (removes a -> b)
+        graph.write_adjacency(a, std::vector<NodeId>{c}, std::vector<EdgeLightMeta>(1));
+        require(query_neighbors(graph, state, stats) == (std::vector<NodeId>{a, c}),
+                "step 3: updated to a -> c (b removed)");
+        require(stats.hot_rows == 1 && stats.cold_rows == 0,
+                "step 3: COW update keeps a hot without RocksDB fallback");
+
+        // Drain EBR epochs: both retired old slabs must be reclaimed.
+        for (int i = 0; i < 3; ++i) (void)graph.hot_tier().try_reclaim();
+        require(graph.hot_tier().stats().retired_slots == 0,
+                "all retired slabs from a's updates reclaimed");
+    }
+
+    // 4. Reopen from RocksDB to verify final state (a -> c) is durable.
+    {
+        RocksDbGraphStore reopened(path);
+        TieredGraph graph(reopened, 64);
+        TieredBfsState state;
+        TieredBfsStats stats;
+        require(query_neighbors(graph, state, stats) == (std::vector<NodeId>{a, c}),
+                "step 4: reopened store preserves final state a -> c");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -315,6 +378,8 @@ int main() {
     test_storage_bfs(path.string());
     std::filesystem::remove_all(path);
     test_tiered_graph(path.string());
+    std::filesystem::remove_all(path);
+    test_write_update_visibility(path.string());
     std::filesystem::remove_all(path);
     std::cout << "rocksdb store tests passed\n";
     return 0;

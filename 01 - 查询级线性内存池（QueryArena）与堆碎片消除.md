@@ -66,7 +66,7 @@
 * **概念白话解读：TLB（转译后备缓冲器）**  
   * 程序通过虚拟地址访问内存，硬件存储器通过物理地址寻址。CPU 内存管理单元（MMU）通过查找 DRAM 中的多级页表实现虚拟页号向物理页框号的转换。TLB（转译后备缓冲器）是片内硬件缓存，用于保存近期用到的虚拟到物理地址映射关系（L1 数据 TLB 通常包含 64 个条目，可覆盖 64 \* 4KB \= 256KB 内存）。若内存页离散分布，超过 64 个页面的访问会导致 TLB 溢出失效（TLB Miss），迫使 CPU 执行多级 DRAM 页表查询。  
 * **架构约束：预分配连续大块空间**  
-  * 通过预分配连续兆字节级内存块（并透明绑定 2MB 大页 THP），最大限度降低图遍历期间的 TLB Miss 频率。
+  * 通过预分配连续兆字节级内存块（默认 16MB 单块），最大限度降低图遍历期间的 TLB Miss 频率（Linux 生产环境可进一步配合 `madvise(..., MADV_HUGEPAGE)` 透明绑定 2MB 大页 THP，当前跨平台实现使用 `posix_memalign` + 4KB 逐页预热）。
 
 ### **1.3.4 约束四：缺页中断（Minor Page Fault）开销与预热触碰（Pre-faulting）**
 
@@ -126,47 +126,69 @@
 * 工程决策分析  
   * 放弃单个对象的 free 能力，换取零堆碎片与极致的 O(1) 批量回收效率。
 
-### **2.4.2 失效防护：0xCD 内存毒化与悬空指针检测**
+### **2.4.2 工程实践：热路径单向原生队列 + `LLG_NOINLINE` 冷路径隔离**
+
+* **热路径去 `std::vector` 抽象（`TieredGraph::run`）**  
+  * `std::vector::push_back` 即便接入 `ArenaAllocator`，仍保留容量检查与扩容搬迁的冷路径分支；在高频 BFS 热循环中，直接从 `QueryArena` 一次性划出整块连续内存作为**单向原生 `LocalNodeId` 队列**（`*hot_tail++ = nl`，仅与 `hot_limit` 比较），彻底消除扩容分支、拷贝与容器抽象开销。  
+* **`allocate()` 标记 `noinline`**  
+  * 对使用 `ArenaAllocator<T>` 的通用容器场景，给 `QueryArena::allocate()` 标注跨平台 `LLG_NOINLINE`（`__attribute__((noinline))` / `__declspec(noinline)`），防止编译器将分配与异常抛出逻辑内联进调用者的热循环导致寄存器溢写（Register Spilling）。
+
+### **2.4.3 失效防护：0xCD 内存毒化与悬空指针检测**
 
 * 概念白话解读：0xCD 内存毒化（Memory Poisoning）  
   * 在 Debug 模式下执行 reset() 时，内存池会将整个 Arena 缓冲区中的字节统一写入二进制值 0xCD。原有的废弃对象内存将被填充为非法位模式（0xCDCDCDCDCDCDCDCD）。当悬空指针试图解引用或读取已被重置的内存时，由于 0xCDCDCDCD 不是合法地址或有效数据，程序将以确定性的方式立即崩溃，从而暴露出野指针问题。
 
 # **3\. Detail Design（详细设计与核心代码）**
 
-## **3.1 核心 C++20 实现（QueryArena 与 ArenaAllocator）**
+## **3.1 核心 C++20 实现（QueryArena、ArenaScope 与 ArenaAllocator）**
 
-```
+```cpp
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 
+#if defined(_MSC_VER)
+#define LLG_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define LLG_NOINLINE __attribute__((noinline))
+#else
+#define LLG_NOINLINE
+#endif
+
 class QueryArena {
 public:
-    static constexpr size_t kCacheLineAlignment = 64; // 64字节缓存行对齐
-    static constexpr size_t kPageSize = 4096;          // 操作系统4KB页大小
-    static constexpr size_t kDefaultCapacity = 16 * 1024 * 1024; // 默认16MB主块，同时是单查询硬性配额
+    static constexpr size_t kAlignment = 64;                      // 64字节缓存行对齐
+    static constexpr size_t kPageSize = 4096;                     // 操作系统4KB页大小
+    static constexpr size_t kDefaultAlignment = 8;                // 默认8字节对齐
+    static constexpr size_t kDefaultCapacity = 16U * 1024U * 1024U; // 默认16MB主块，同时是单查询硬性配额
 
     explicit QueryArena(size_t capacity = kDefaultCapacity)
         : capacity_(capacity), offset_(0) {
+        if (capacity_ == 0) {
+            throw std::invalid_argument("QueryArena: capacity must be positive");
+        }
         // 向系统申请 64 字节缓存行边界对齐的内存
         void* ptr = nullptr;
-        if (posix_memalign(&ptr, kCacheLineAlignment, capacity_) != 0) {
+        if (posix_memalign(&ptr, kAlignment, capacity_) != 0) {
             throw std::bad_alloc();
         }
         buffer_ = static_cast<char*>(ptr);
         // 线程启动预热触碰，提前向物理页写0，消除运行期缺页中断
-        pre_fault_pages(buffer_, capacity_);
+        pre_fault();
     }
 
     ~QueryArena() { std::free(buffer_); }
 
     QueryArena(const QueryArena&) = delete;
     QueryArena& operator=(const QueryArena&) = delete;
+    QueryArena(QueryArena&&) = delete;
+    QueryArena& operator=(QueryArena&&) = delete;
 
     // 查询进入：要求上一次查询已 reset
     void begin_query() const {
@@ -175,12 +197,19 @@ public:
         }
     }
 
-    // 热路径线性递增分配核心算法
-    void* allocate(size_t bytes, size_t alignment = 8) {
-        uintptr_t current_addr = reinterpret_cast<uintptr_t>(buffer_ + offset_);
+    // 热路径线性递增分配核心算法（noinline 防止将扩容/异常路径内联污染热循环）
+    LLG_NOINLINE void* allocate(size_t bytes, size_t alignment = kDefaultAlignment) {
+        if (bytes == 0) {
+            return nullptr;
+        }
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+            throw std::invalid_argument("QueryArena: alignment must be a power of two");
+        }
+        uintptr_t current_addr = reinterpret_cast<uintptr_t>(buffer_) + offset_;
         // 快速位掩码计算向上取整对齐地址
-        uintptr_t aligned_addr = (current_addr + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
-        size_t padding = aligned_addr - current_addr;
+        uintptr_t aligned_addr =
+            (current_addr + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
+        size_t padding = static_cast<size_t>(aligned_addr - current_addr);
         size_t remaining = capacity_ - offset_;
 
         // 单查询硬性配额：主块容量即上限，放不下直接熔断，不扩展
@@ -196,7 +225,7 @@ public:
     T* construct(Args&&... args) {
         // 编译期安检门：要求T必须没有复杂析构逻辑
         static_assert(std::is_trivially_destructible_v<T>,
-            "QueryArena 内存池中的对象必须具有平凡析构函数!");
+            "QueryArena only constructs trivially destructible objects");
         void* mem = allocate(sizeof(T), alignof(T));
         // Placement New: 不找系统要内存，直接在已有内存 mem 上原地初始化对象
         return ::new (mem) T(std::forward<Args>(args)...);
@@ -211,15 +240,16 @@ public:
         offset_ = 0; // 游标直接归零
     }
 
-    size_t used_bytes() const noexcept { return offset_; }
-    size_t capacity() const noexcept { return capacity_; }
+    [[nodiscard]] size_t used_bytes() const noexcept { return offset_; }
+    [[nodiscard]] size_t capacity() const noexcept { return capacity_; }
 
 private:
-    void pre_fault_pages(char* buffer, size_t size) {
+    void pre_fault() noexcept {
         // 以 4KB 步长逐页写触碰，触发操作系统分配真正的物理页框
-        for (size_t i = 0; i < size; i += kPageSize) {
-            buffer[i] = 0;
+        for (size_t i = 0; i < capacity_; i += kPageSize) {
+            buffer_[i] = 0;
         }
+        buffer_[capacity_ - 1] = 0;
     }
 
     char* buffer_{nullptr};
@@ -243,7 +273,7 @@ private:
     QueryArena& arena_;
 };
 
-// STL 标准分配器适配器
+// STL 标准分配器适配器（通用容器可用；BFS 热路径优先直接切分原生数组）
 template <typename T>
 class ArenaAllocator {
 public:
@@ -253,17 +283,22 @@ public:
     ArenaAllocator(const ArenaAllocator<U>& other) noexcept : arena_(other.arena()) {}
 
     T* allocate(size_t n) {
+        if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            throw std::bad_alloc();
+        }
         return static_cast<T*>(arena_->allocate(n * sizeof(T), alignof(T)));
     }
     void deallocate(T*, size_t) noexcept {
         // 单个 deallocate 空操作化，不做任何事情
     }
-    QueryArena* arena() const noexcept { return arena_; }
+    [[nodiscard]] QueryArena* arena() const noexcept { return arena_; }
     template <typename U> bool operator==(const ArenaAllocator<U>& o) const noexcept { return arena_ == o.arena(); }
     template <typename U> bool operator!=(const ArenaAllocator<U>& o) const noexcept { return arena_ != o.arena(); }
 private:
     QueryArena* arena_{nullptr};
 };
+
+#undef LLG_NOINLINE
 ```
 
 ## **3.2 核心 C++ 底层语法与关键字逐项解读**

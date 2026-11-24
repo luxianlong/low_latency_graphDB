@@ -1,6 +1,6 @@
 #pragma once
 
-#include "low_latency_graphdb/in_memory_graph.hpp"
+#include "low_latency_graphdb/testing/in_memory_graph.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
 
 #include <algorithm>
@@ -11,10 +11,6 @@
 #include <vector>
 
 namespace low_latency_graphdb {
-
-struct TraversalResult {
-    std::vector<NodeId> visited;
-};
 
 class BreadthFirstSearch {
 public:

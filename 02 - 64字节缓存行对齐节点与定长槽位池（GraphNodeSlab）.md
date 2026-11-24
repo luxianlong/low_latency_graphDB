@@ -59,10 +59,10 @@
 * **概念白话解读：用空闲内存自身存放链表指针**  
   传统空闲链表需要为每个槽位单独分配一个链表包装节点（如 `struct Node { void* data; Node* next; }`），产生额外的内存开销。嵌入式空闲链表巧妙利用 C++ `union` 语法：当槽位处于闲置状态时，将其前 8 字节视作指针，直接存放下一个空闲槽位的内存地址；当槽位被分配使用时，这 8 字节又被覆写为真正的节点数据。这样实现了管理元数据开销严格为 0 字节。
 
-### **1.3.4 底层原理 4：溢出链与硬件预取器协同（Overflow Chaining & Hardware Prefetching）**
+### **1.3.4 底层原理 4：溢出索引与硬件预取器协同（Overflow Indexing & Hardware Prefetching）**
 
-* **概念白话解读：超级节点的溢出指针扩展**  
-  当某个 Hub 节点的出度超过 11 时，结构体最后 8 字节的 `overflow_ptr` 将激活，指向一块连续分配的溢出邻居数组。由于溢出数组在内存中保持连续存储，对超长邻接表的扫描能够完美触发 CPU 的线性硬件预取器（Linear Hardware Prefetcher）。
+* **概念白话解读：用 4 字节 `overflow_index` 替代 8 字节裸指针**  
+  `node_id`（8B）+ `count`（4B）+ `flags`（4B）+ `inline_neighbors[11]`（44B）恰好占用 60 字节，结构体末尾剩余 **4 字节**（`0x3C–0x3F`）。因此最后 4 字节存放 `uint32_t overflow_index`（而非 8 字节指针），在严格锁定 `sizeof(GraphNodeSlab) == 64` 且保持结构体平凡析构（trivially destructible）的前提下，索引到 `HotTier` 的分段连续溢出邻居数组（`OverflowStore`），依然能够触发 CPU 线性硬件预取器。
 
 ### **1.3.5 RocksDB 原生提供能力（Storage Layer Boundary）**
 
@@ -74,231 +74,233 @@
 ### **1.3.6 自研引擎设计组件（Compute Layer Boundary）**
 
 * **64 字节定长节点布局（GraphNodeSlab）**  
-  自研计算层精确封装 `GraphNodeSlab` 结构体，锁定 64 字节物理对齐与内联邻居排布。  
-* **定长槽位内存池（FixedSlabPool）**  
-  自研内存池通过大页预分配与 `union SlabNode` 嵌入式空闲链表实现 O(1) 槽位分配与无琐回收。  
-* **热点子图缓存控制器（Hot Topology Cache Hydration）**  
-  自研控制器负责从 RocksDB 读取原始字节流填充槽位，并在边变更时完成拓扑的高效失效与更新。
+  自研计算层精确封装 `GraphNodeSlab` 结构体，锁定 64 字节物理对齐、11 个内联邻居与 4 字节 `overflow_index`。  
+* **定长槽位内存池（FixedSlabPool）与无锁纪元协调器（EpochTracker）**  
+  自研内存池通过 `posix_memalign` 预分配、4KB 预热触碰、`union SlabSlot` 嵌入式空闲链表与三桶 EBR 实现 O(1) 槽位分配与延迟安全回收；`EpochTracker` 使用按 64 字节隔离的读槽位保障多核无锁读。  
+* **按需加载热层（Read-Through `HotTier`）**  
+  移除独立的 `warm()` / 全量重建步骤：首次访问未命中时批量通过 `PinnableSlice` + `ZeroCopyAdjView` 从 RocksDB 按需填充 `FixedSlabPool`（配合 `write_seq_` 防止并发写脏数据回填）；写变更时先落盘 RocksDB，再从 `FixedSlabPool` 分配新槽位做原地 COW 原子替换，旧槽位与溢出边数组一并交由 EBR 回收，写完立刻继续热命中。
 
 # **2\. High-Level Design**
 
 ## **2.1 GraphNodeSlab 精确 64 字节物理字节布局**
 
-\`\`\`text  
-\+---------------------------------------------------------------+  
-\|                 GraphNodeSlab (64 Bytes)                      \|  
-\+---------------+-------+-------+-------------------------------+  
-\| node\_id       \| count \| flags \| inline\_neighbors (11 x 4B)    \|  
-\| (8 Bytes)     \| (4B)  \| (4B)  \| (44 Bytes)                    \|  
-\+---------------+-------+-------+---------------+---------------+  
-\| 0x00      0x07\|0x08 0x0B\|0x0C 0x0F\|0x10       0x3B\|0x3C       0x3F\|  
-\+---------------+-------+-------+---------------+---------------+  
-\| overflow\_ptr (8 Bytes)                                        \|  
-\+---------------------------------------------------------------+  
-\`\`\`
+```text
++---------------------------------------------------------------+
+|                 GraphNodeSlab (64 Bytes)                      |
++---------------+-------+-------+-----------------------+-------+
+| node_id       | count | flags | inline_neighbors      | ovf   |
+| (8 Bytes)     | (4B)  | (4B)  | (11 x 4B = 44 Bytes)  | (4B)  |
++---------------+-------+-------+-----------------------+-------+
+| 0x00 .. 0x07  |08..0B |0C..0F | 0x10 ........... 0x3B |3C..3F |
++---------------+-------+-------+-----------------------+-------+
+                                                         overflow_index
+```
 
-## **2.2 FixedSlabPool 嵌入式空闲链表内存池模型**
+## **2.2 FixedSlabPool 嵌入式空闲链表与 EBR 三桶回收模型**
 
-\`\`\`text  
-\+---------------------------------------------------------------+  
-\|                  FixedSlabPool Free-List                      \|  
-\+---------------------------------------------------------------+  
-\| free\_head\_ \---\> \[ Slab Node 1 \] \---\> \[ Slab Node 2 \] \---\> null\|  
-\|                 (0x00-0x07: next)    (0x00-0x07: next)        \|  
-\+---------------------------------------------------------------+  
-\`\`\`
+```text
++---------------------------------------------------------------+
+|                  FixedSlabPool Free-List                      |
++---------------------------------------------------------------+
+| free_head_ ---> [ SlabSlot 1 ] ---> [ SlabSlot 2 ] ---> null  |
+|                 (0x00-0x07: next)   (0x00-0x07: next)         |
++---------------------------------------------------------------+
+| EBR retire_buckets_[3]: [epoch % 3]                           |
+|   retire_slot() 挂入当前纪元桶 -> try_advance() 确认所有读线程  |
+|   越过安全纪元 -> reclaim_epoch() 回调释放溢出边 + 毒化 + 回链   |
++---------------------------------------------------------------+
+```
 
-## **2.3 节点加载、遍历与失效生命周期（Lifecycle Flow）**
+## **2.3 节点按需加载、遍历与 COW/EBR 更新生命周期（Lifecycle Flow）**
 
-* **阶段一：批量大页预分配与链表串联（Chunk Pre-allocation）**  
-  内存池启动时通过 `posix_memalign` 一次性申请 64 字节对齐的物理连续大块内存，并将其切割为多个槽位，利用嵌入式指针串联为空闲链表。  
-* **阶段二：热点节点冷加载与内联填充（Cache Hydration from RocksDB）**  
-  当图遍历引擎发现热点节点未在计算层缓存时，向 RocksDB 读取原始邻接表，弹出池中空闲槽位并在该对齐内存上完成 `GraphNodeSlab` 的构造与前 11 个邻居的内联填充。  
-* 阶段三：热路径单缓存行命中遍历（Single Cache-Line Traversal）  
-  由于节点首地址按 64 字节对齐，CPU 单次 L1 缓存行加载动作即可将节点 ID、度数以及前 11 个邻居完整载入核心寄存器，实现极速图跳跃。  
-* 阶段四：高度数超级节点溢出跳转（Overflow Array Traversal）  
-  当节点出度大于 11 时，遍历逻辑在读取完内联邻居后，顺着 overflow\_ptr 指针访问连续的溢出数组，触发硬件预取以加速后续边读取。  
-* 阶段五：写变更失效与 O(1) 槽位回收（Invalidation & Intrusive Free）  
-  当拓扑结构发生边修改时，对应节点的槽位被废弃。调用回收逻辑清理溢出块后，将槽位前 8 字节覆写为当前空闲链表头指针，实现 O(1) 入链回收。
+* **阶段一：批量对齐预分配与链表串联（Pool Pre-allocation）**  
+  内存池启动时通过 `posix_memalign` 一次性申请 64 字节对齐的物理连续大块内存，按 4KB 步长写触碰消除运行期缺页中断，并将所有 `SlabSlot` 通过 `next_free` 串联为嵌入式空闲链表。  
+* **阶段二：按需冷加载与内联填充（On-Demand Read-Through，无需 `warm()`）**  
+  BFS 首次碰到尚未加载的顶点（`slabs_[local] == nullptr`）时，收集本层未命中顶点按 ID 排序后发起一次 `PinnableSlice` 批量 `MultiGet`，经 `ZeroCopyAdjView` 零拷贝解码后弹出 `FixedSlabPool` 空闲槽位填充前 11 个内联邻居（超出部分写入分段 `OverflowStore`），校验 `write_seq_` 无并发写冲突后原子发布。  
+* **阶段三：热路径单缓存行无锁遍历（Single Cache-Line Traversal）**  
+  查询入口通过 `EpochTracker::ReadGuard` 进入无锁读纪元（整次 BFS 只进出一次）。遍历时按 `LocalNodeId` 读取 64B 对齐的 `GraphNodeSlab`，单次 L1 缓存行加载即可拿到节点头和前 11 个邻居，配合 `QueryArena` 单向原生队列推进。  
+* **阶段四：高度数节点溢出访问（Overflow Table Traversal）**  
+  当节点出度大于 11 时，通过 4 字节 `overflow_index` 查 `OverflowStore` 分段指针表（无锁读），连续扫描溢出邻居数组以触发硬件预取。  
+* **阶段五：写变更原地 COW 替换与 EBR 延迟回收（Live COW + EBR）**  
+  `write_adjacency` 先原子写入 RocksDB，再从 `FixedSlabPool` 分配新 64B 槽位构造新邻接表，对 `slabs_[local]` 执行 `atomic::exchange` 原子切换，将旧槽位挂入 `retire_buckets_[epoch % 3]`。写完节点**立刻保持热命中**；当所有并发读线程离开旧纪元后，`reclaim_epoch` 通过回调同步释放旧槽位的溢出数组，并在 Debug 模式 `0xCD` 毒化后 O(1) 挂回 `free_head_`。
 
 ## **2.4 关键工程权衡与失效模式防护（Trade-offs & Failure Modes）**
 
-* 权衡一：稀疏节点内部碎片 vs. 消除指针追踪  
-  对于出度仅为 2 的节点，Slab 结构体内部会存在约 36 字节的空闲碎片。然而，由于 CPU 硬件的最小传输粒度固定为 64 字节，即使分配更小的结构体，传输开销依然相同。用微小的内存碎片换取消除二重指针跳转（省去 \~250 个周期），是极其高回报的工程设计。  
-* 权衡二：32 位压缩邻居 ID vs. 64 位全局 ID  
-  如果内联数组存储 64 位全局 ID，44 字节空间仅能容纳 5 个邻居。通过在图分区内采用基于字典编码的 32 位局部编号，内联容量直接提升至 11 个邻居，将内联覆盖率从 \~80% 大幅拉升至 95% 以上。  
-* 失效防护：溢出内存释放与 ABA / 悬空引用防护  
-  在回收槽位入链之前，必须确保优先释放 overflow\_ptr 所指向的外置内存，防止出现内存泄漏。多线程并发环境下，结合 Epoch-Based Reclamation (EBR) 机制保护无锁读路径，防止并发读线程在槽位被回收覆写时访问到悬空内存。
+* **权衡一：稀疏节点内部碎片 vs. 消除指针追踪**  
+  对于出度仅为 2 的节点，Slab 结构体内部会存在约 36 字节的空闲碎片。然而，由于 CPU 硬件的最小传输粒度固定为 64 字节，即使分配更小的结构体，传输开销依然相同。用微小的内存碎片换取消除二重指针跳转，是极其高回报的工程设计。  
+* **权衡二：32 位局部 ID + 4 字节 `overflow_index` vs. 64 位全局 ID 与 8 字节指针**  
+  如果内联数组存储 64 位全局 ID，44 字节空间仅能容纳 5 个邻居；采用分区内 32 位 `LocalNodeId` 后，内联容量提升至 11 个邻居（覆盖 >92% 的幂律节点），同时末尾 4 字节 `overflow_index` 保证了严格 64 字节尺寸与 `is_trivially_destructible_v`。  
+* **失效防护：溢出内存零泄漏、写读竞态与悬空引用防护**  
+  1. `reclaim_epoch(safe_epoch, on_reclaim)` 在回收旧槽位前自动通过回调释放 `OverflowStore` 中的外置数组，杜绝高出度节点反复更新导致的内存泄漏；  
+  2. `EpochTracker` 结合 `shared_ptr` 托管 `ReaderHandle`，防止 `thread_local` 读状态析构晚于图实例产生悬空引用；  
+  3. 按需回填校验 `write_seq_`，防止旧 RocksDB 快照读结果覆盖新写入的 COW 槽位。
 
 # **3\. Detail Design**
 
-## **3.1 核心 C++20 实现（GraphNodeSlab、FixedSlabPool 与无锁热路径遍历）**
+## **3.1 核心 C++20 实现（GraphNodeSlab、FixedSlabPool 与 EpochTracker）**
 
-以下为 64 字节缓存行对齐节点（`GraphNodeSlab`）、嵌入式空闲链表槽位（`SlabSlot`）以及结合 EBR 延迟回收机制的定长槽位池（`FixedSlabPool`）的完整 C++20 核心实现代码：
+以下为实际落地在 `include/low_latency_graphdb/graph_node_slab.hpp` 中的核心实现：
 
-```c#
+```cpp
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <cassert>
-#include <atomic>
-#include <vector>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <new>
-#include <functional>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+using NodeId = std::uint64_t;
+using LocalNodeId = std::uint32_t;
 
 // -----------------------------------------------------------------------------
-// 1. GraphNodeSlab: 精确 64 字节物理对齐节点
+// 1. GraphNodeSlab: 精确 64 字节物理对齐节点（平凡析构）
 // -----------------------------------------------------------------------------
 struct alignas(64) GraphNodeSlab {
-    uint64_t node_id;               // [0x00-0x07] 8 Bytes: 节点全局 ID
-    uint32_t count;                 // [0x08-0x0B] 4 Bytes: 总出度（Out-Degree）
-    uint32_t flags;                 // [0x0C-0x0F] 4 Bytes: 状态标识位
-    uint32_t inline_neighbors[11];  // [0x10-0x3B] 44 Bytes: 内联存储前 11 个邻居 ID (11 * 4B)
-    uint32_t* overflow_ptr;         // [0x3C-0x3F] 8 Bytes (Aligned): 指向溢出邻居数组的指针
+    NodeId node_id{0};                      // [0x00-0x07] 8B: 节点全局 ID
+    std::uint32_t count{0};                 // [0x08-0x0B] 4B: 总出度
+    std::uint32_t flags{0};                 // [0x0C-0x0F] 4B: 状态标识位
+    std::array<LocalNodeId, 11> inline_neighbors{}; // [0x10-0x3B] 44B: 内联前 11 个邻居
+    std::uint32_t overflow_index{0};        // [0x3C-0x3F] 4B: 溢出数组索引（OverflowStore）
 
-    // 构造函数
-    GraphNodeSlab(uint64_t id, uint32_t total_count)
-        : node_id(id), count(total_count), flags(0), overflow_ptr(nullptr) {
-        std::memset(inline_neighbors, 0, sizeof(inline_neighbors));
-    }
-
-    // 析构函数：确保外置溢出数组被正确释放
-    ~GraphNodeSlab() {
-        if (overflow_ptr != nullptr) {
-            std::free(overflow_ptr);
-            overflow_ptr = nullptr;
-        }
-    }
-
-    // 热路径遍历辅助函数：优先读取内联邻居，超出 11 个时自动遍历溢出数组
-    template <typename Visitor>
-    void for_each_neighbor(Visitor&& visitor) const {
-        uint32_t inline_limit = count < 11 ? count : 11;
-        for (uint32_t i = 0; i < inline_limit; ++i) {
-            visitor(inline_neighbors[i]);
-        }
-        if (count > 11 && overflow_ptr != nullptr) {
-            uint32_t overflow_count = count - 11;
-            for (uint32_t i = 0; i < overflow_count; ++i) {
-                visitor(overflow_ptr[i]);
-            }
-        }
+    [[nodiscard]] bool has_overflow() const noexcept {
+        return count > inline_neighbors.size();
     }
 };
 
-// 静态断言：强行校验尺寸与对齐要求
-static_assert(sizeof(GraphNodeSlab) == 64, "GraphNodeSlab must be exactly 64 bytes!");
-static_assert(alignof(GraphNodeSlab) == 64, "GraphNodeSlab must be aligned to 64 bytes!");
+static_assert(sizeof(GraphNodeSlab) == 64);
+static_assert(alignof(GraphNodeSlab) == 64);
+static_assert(std::is_trivially_destructible_v<GraphNodeSlab>);
 
 // -----------------------------------------------------------------------------
-// 2. SlabSlot: 嵌入式空闲链表联合体
+// 2. SlabSlot: 嵌入式空闲链表联合体（0 字节额外元数据）
 // -----------------------------------------------------------------------------
 union alignas(64) SlabSlot {
     SlabSlot* next_free;    // 闲置状态：复用前 8 字节保存下一个空闲槽位指针
     GraphNodeSlab node;     // 使用状态：存放真正的 64 字节节点对象
 
-    SlabSlot() {}
-    ~SlabSlot() {}
+    SlabSlot() noexcept : next_free(nullptr) {}
+    ~SlabSlot() noexcept {}
 };
 
-static_assert(sizeof(SlabSlot) == 64, "SlabSlot size must be 64 bytes!");
-static_assert(alignof(SlabSlot) == 64, "SlabSlot alignment must be 64 bytes!");
+static_assert(sizeof(SlabSlot) == 64);
+static_assert(alignof(SlabSlot) == 64);
 
 // -----------------------------------------------------------------------------
-// 3. FixedSlabPool: 定长槽位内存池（含大页预分配、O(1) 分配与 EBR 延迟回收）
+// 3. FixedSlabPool: 定长槽位内存池（64B 对齐预分配、嵌入式空闲链表与三桶 EBR）
 // -----------------------------------------------------------------------------
 class FixedSlabPool {
-private:
-    SlabSlot* free_head_{nullptr};
-    std::vector<void*> chunks_;
-    size_t capacity_{0};
-
-    // 三桶轮转 EBR 延迟回收队列
-    std::vector<SlabSlot*> retire_buckets_[3];
-
 public:
-    explicit FixedSlabPool(size_t node_count) {
-        capacity_ = node_count;
-        size_t total_bytes = node_count * sizeof(SlabSlot);
-        void* raw_ptr = nullptr;
+    static constexpr std::size_t kAlignment = 64;
+    static constexpr std::size_t kPageSize = 4096;
+    static constexpr std::size_t kEpochBuckets = 3;
 
-        // 1. 批量申请 64 字节物理对齐的连续大块内存
-        int ret = posix_memalign(&raw_ptr, 64, total_bytes);
-        if (ret != 0 || !raw_ptr) {
+    explicit FixedSlabPool(std::size_t capacity)
+        : capacity_(capacity), available_(capacity) {
+        if (capacity_ == 0 ||
+            capacity_ > std::numeric_limits<std::size_t>::max() / sizeof(SlabSlot)) {
+            throw std::invalid_argument("FixedSlabPool: invalid capacity");
+        }
+        const std::size_t total_bytes = capacity_ * sizeof(SlabSlot);
+        void* raw = nullptr;
+        if (posix_memalign(&raw, kAlignment, total_bytes) != 0 || raw == nullptr) {
             throw std::bad_alloc();
         }
-        chunks_.push_back(raw_ptr);
+        pre_fault(static_cast<char*>(raw), total_bytes);
 
-        // 2. 按页写触碰（Pre-faulting），消除运行期 OS 缺页中断引发的延迟抖动
-        volatile char* page_touch = static_cast<volatile char*>(raw_ptr);
-        for (size_t i = 0; i < total_bytes; i += 4096) {
-            page_touch[i] = 0;
+        slots_ = static_cast<SlabSlot*>(raw);
+        for (std::size_t i = 0; i + 1 < capacity_; ++i) {
+            slots_[i].next_free = &slots_[i + 1];
         }
-
-        // 3. 将物理连续槽位串联为嵌入式空闲链表
-        SlabSlot* slots = static_cast<SlabSlot*>(raw_ptr);
-        for (size_t i = 0; i < node_count - 1; ++i) {
-            slots[i].next_free = &slots[i + 1];
-        }
-        slots[node_count - 1].next_free = nullptr;
-        free_head_ = &slots[0];
+        slots_[capacity_ - 1].next_free = nullptr;
+        free_head_ = &slots_[0];
     }
 
-    ~FixedSlabPool() {
-        for (void* chunk : chunks_) {
-            std::free(chunk);
-        }
-    }
+    ~FixedSlabPool() { std::free(slots_); }
 
-    // O(1) 槽位分配：Placement New 原地构造 GraphNodeSlab
     template <typename... Args>
-    GraphNodeSlab* allocate_slot(Args&&... args) {
-        if (free_head_ == nullptr) {
-            return nullptr; // 内存池已耗尽
-        }
+    GraphNodeSlab* allocate(Args&&... args) {
+        std::lock_guard lock(mutex_);
+        if (free_head_ == nullptr) return nullptr;
         SlabSlot* slot = free_head_;
         free_head_ = slot->next_free;
-
-        // 原地构造对象
-        ::new (static_cast<void*>(&slot->node)) GraphNodeSlab(std::forward<Args>(args)...);
-        return &slot->node;
+        --available_;
+        return ::new (static_cast<void*>(&slot->node)) GraphNodeSlab{std::forward<Args>(args)...};
     }
 
-    // O(1) 立即回收：显式调用析构函数，释放 overflow_ptr 内存并归还链表
-    void free_slot(GraphNodeSlab* node_ptr) {
-        if (!node_ptr) return;
-        SlabSlot* slot = reinterpret_cast<SlabSlot*>(node_ptr);
-
-        // 优先显式调用析构函数（回收可能存在的外置 overflow_ptr 内存）
-        node_ptr->~GraphNodeSlab();
-
-#ifndef NDEBUG
-        // Debug 模式下填充 0xCD 毒化数据，及时捕捉野指针访问与二次释放错误
-        std::memset(slot, 0xCD, sizeof(SlabSlot));
-#endif
-
-        // 重新入链
-        slot->next_free = free_head_;
-        free_head_ = slot;
+    void release(GraphNodeSlab* node) noexcept {
+        if (node == nullptr) return;
+        std::lock_guard lock(mutex_);
+        recycle_locked(reinterpret_cast<SlabSlot*>(node));
     }
 
-    // EBR 退休入列：暂不释放内存，挂载至当前 Epoch 对应的退役桶中
-    void retire_slot(GraphNodeSlab* node_ptr, uint64_t current_epoch) {
-        if (!node_ptr) return;
-        SlabSlot* slot = reinterpret_cast<SlabSlot*>(node_ptr);
-        size_t bucket_idx = current_epoch % 3;
-        retire_buckets_[bucket_idx].push_back(slot);
+    void retire_slot(GraphNodeSlab* node, std::uint64_t current_epoch) {
+        if (node == nullptr) return;
+        std::lock_guard lock(mutex_);
+        retire_buckets_[current_epoch % kEpochBuckets].push_back(
+            reinterpret_cast<SlabSlot*>(node));
+        ++retired_;
     }
 
-    // EBR 纪元回收：确认安全纪元（safe_epoch）到达后批量执行析构与槽位入链
-    void reclaim_epoch(uint64_t safe_epoch) {
-        size_t bucket_idx = safe_epoch % 3;
-        auto& bucket = retire_buckets_[bucket_idx];
+    template <typename OnReclaim>
+    std::size_t reclaim_epoch(std::uint64_t safe_epoch, OnReclaim&& on_reclaim) noexcept {
+        std::lock_guard lock(mutex_);
+        auto& bucket = retire_buckets_[safe_epoch % kEpochBuckets];
+        const std::size_t count = bucket.size();
         for (SlabSlot* slot : bucket) {
-            free_slot(&slot->node);
+            on_reclaim(slot->node); // 释放关联的溢出边数组（如有）
+            recycle_locked(slot);
         }
         bucket.clear();
+        retired_ -= count;
+        return count;
     }
+
+    std::size_t reclaim_epoch(std::uint64_t safe_epoch) noexcept {
+        return reclaim_epoch(safe_epoch, [](const GraphNodeSlab&) noexcept {});
+    }
+
+private:
+    static void pre_fault(char* buffer, std::size_t bytes) noexcept {
+        for (std::size_t i = 0; i < bytes; i += kPageSize) buffer[i] = 0;
+        buffer[bytes - 1] = 0;
+    }
+
+    void recycle_locked(SlabSlot* slot) noexcept {
+        slot->node.~GraphNodeSlab();
+#ifndef NDEBUG
+        std::memset(static_cast<void*>(slot), 0xCD, sizeof(SlabSlot));
+#endif
+        slot->next_free = free_head_;
+        free_head_ = slot;
+        ++available_;
+    }
+
+    mutable std::mutex mutex_;
+    SlabSlot* slots_{nullptr};
+    SlabSlot* free_head_{nullptr};
+    std::size_t capacity_{0};
+    std::size_t available_{0};
+    std::size_t retired_{0};
+    std::array<std::vector<SlabSlot*>, kEpochBuckets> retire_buckets_{};
+};
+
+// -----------------------------------------------------------------------------
+// 4. EpochTracker: 无锁读三纪元 EBR 协调器（读槽位 64B 隔离防伪共享）
+// -----------------------------------------------------------------------------
+class EpochTracker : public std::enable_shared_from_this<EpochTracker> {
+public:
+    static constexpr std::size_t kMaxReaders = 128;
+    static constexpr std::uint64_t kInactive = std::numeric_limits<std::uint64_t>::max();
+    // 提供 register_reader() -> ReaderHandle、RAII ReadGuard、retire() 与 try_advance()
+    // 详见 include/low_latency_graphdb/graph_node_slab.hpp
 };
 ```
 

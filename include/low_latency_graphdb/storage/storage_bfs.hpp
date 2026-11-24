@@ -1,7 +1,7 @@
 #pragma once
 
-#include "low_latency_graphdb/breadth_first_search.hpp"
-#include "low_latency_graphdb/rocksdb_graph_store.hpp"
+#include "low_latency_graphdb/graph_node_slab.hpp"
+#include "low_latency_graphdb/storage/rocksdb_graph_store.hpp"
 
 #include <algorithm>
 #include <cstddef>

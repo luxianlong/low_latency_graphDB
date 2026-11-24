@@ -19,9 +19,9 @@
 // back-edge to its parent), bulk-loads it, reopens the DB, warms the block
 // cache, then times Q depth-D BFS queries per thread. The in-memory BFS on the
 // same graph is measured as a baseline.
-#include "low_latency_graphdb/breadth_first_search.hpp"
-#include "low_latency_graphdb/storage_bfs.hpp"
-#include "low_latency_graphdb/tiered_graph.hpp"
+#include "low_latency_graphdb/storage/storage_bfs.hpp"
+#include "low_latency_graphdb/storage/tiered_graph.hpp"
+#include "low_latency_graphdb/testing/breadth_first_search.hpp"
 
 #include <algorithm>
 #include <atomic>
