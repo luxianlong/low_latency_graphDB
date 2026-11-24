@@ -111,7 +111,7 @@ Config parse(int argc, char** argv) {
         usage("invalid sizes");
     }
     if (config.hot_tier == std::numeric_limits<std::uint64_t>::max()) {
-        config.hot_tier = config.nodes / 20;
+        config.hot_tier = config.nodes;
     }
     // Hot tier = vertex IDs [0, K), the top of the tree. A start below
     // K / fanout^depth has its whole depth-D neighborhood inside the tier.
@@ -298,16 +298,7 @@ int main(int argc, char** argv) {
     }
 
     if (config.hot_tier != 0) {
-        TieredGraph tiered(store);
-        const auto warm_begin = Clock::now();
-        std::vector<NodeId> hot_ids(std::min(config.hot_tier, config.nodes));
-        for (std::size_t i = 0; i < hot_ids.size(); ++i) hot_ids[i] = i;
-        tiered.warm(hot_ids);
-        const auto& tier_stats = tiered.hot_tier()->stats();
-        std::cout << "hot tier: " << tier_stats.hot_nodes << " hot + " << tier_stats.stub_nodes
-                  << " stub nodes, " << std::fixed << std::setprecision(1)
-                  << tier_stats.bytes / 1048576.0 << " MiB, built in " << std::setprecision(2)
-                  << std::chrono::duration<double>(Clock::now() - warm_begin).count() << "s\n";
+        TieredGraph tiered(store, config.hot_tier);
         TieredBfsOptions tiered_options;
         tiered_options.max_depth = config.depth;
         tiered_options.pin_batch_size = config.pin_batch;
@@ -335,6 +326,11 @@ int main(int argc, char** argv) {
                   << " hot_rows=" << (hot + cold ? 100.0 * hot / (hot + cold) : 0.0) << "%";
             print_row("tiered", threads, summarize(merge(samples), wall, config.batch), extra.str());
         }
+        const auto tier_stats = tiered.hot_tier().stats();
+        std::cout << "hot tier (read-through FixedSlabPool): " << tier_stats.loaded_nodes
+                  << " loaded / " << tier_stats.registered_nodes << " registered / "
+                  << tier_stats.pool_capacity << " slots, " << std::fixed << std::setprecision(1)
+                  << tier_stats.bytes / 1048576.0 << " MiB\n";
     }
 
     if (config.baseline) {

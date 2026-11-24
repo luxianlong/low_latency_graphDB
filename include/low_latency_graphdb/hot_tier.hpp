@@ -1,238 +1,391 @@
 #pragma once
 
+#include "low_latency_graphdb/adjacency_view.hpp"
 #include "low_latency_graphdb/graph_node_slab.hpp"
 #include "low_latency_graphdb/rocksdb_graph_store.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <queue>
+#include <mutex>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 namespace low_latency_graphdb::storage {
 
-// Immutable in-memory snapshot of the hottest vertices (Tier 1 of the design).
+// Live, read-through in-memory hot tier backed by `FixedSlabPool` + EBR
+// (`EpochTracker`).
 //
-// Every hot vertex owns a 64-byte GraphNodeSlab whose neighbors are local IDs.
-// Neighbors that are not themselves hot get a "stub" slab (no adjacency, only
-// the node ID) so the traversal can stay in the dense local-ID space and
-// hand the stub to RocksDB when it is reached. Staleness is handled with
-// per-slab dirty flags: a vertex invalidated after the build is traversed via
-// RocksDB, which stays the source of truth, until the tier is rebuilt.
+// Vertices are loaded on demand from RocksDB on first access — there is no
+// separate warm() / rebuild step. Each tracked vertex owns a stable 32-bit
+// `LocalNodeId` in [0, capacity) mapped to an atomic `GraphNodeSlab*` allocated
+// from `FixedSlabPool`. Writes update loaded slabs via copy-on-write (allocate
+// fresh 64-byte slab, atomic exchange, retire old slab through EBR) so hot
+// vertices stay hot immediately without invalidating or rebuilding the tier.
 class HotTier {
 public:
     static constexpr LocalNodeId kNotFound = std::numeric_limits<LocalNodeId>::max();
-    static constexpr std::uint32_t kHotFlag = 1;
+    static constexpr std::uint32_t kLoadedFlag = 1;
+    // Default capacity: 1,048,576 vertices (~64 MiB of slabs + directory).
+    static constexpr std::size_t kDefaultCapacity = 1U << 20;
 
     struct Stats {
-        std::size_t hot_nodes{0};
-        std::size_t stub_nodes{0};
+        std::size_t loaded_nodes{0};
+        std::size_t registered_nodes{0};
+        std::size_t pool_capacity{0};
+        std::size_t pool_available{0};
+        std::size_t retired_slots{0};
         std::size_t overflow_edges{0};
         std::size_t bytes{0};
     };
 
-    // Rebuilds from an explicit vertex set (missing rows are skipped).
-    static std::shared_ptr<const HotTier> build(RocksDbGraphStore& store,
-                                                std::span<const NodeId> hot_ids) {
-        Builder builder;
-        RocksDbGraphStore::AdjacencyHandle handle;
-        std::vector<NodeId> ids(hot_ids.begin(), hot_ids.end());
-        std::sort(ids.begin(), ids.end());
-        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-        for (const NodeId id : ids) {
-            builder.reserve_hot(id);
+    explicit HotTier(std::size_t capacity = kDefaultCapacity)
+        : capacity_(capacity),
+          pool_(capacity + std::max<std::size_t>(capacity / 8, 64)),
+          epoch_tracker_(std::make_shared<EpochTracker>()) {
+        if (capacity_ == 0 || capacity_ >= kNotFound - 1) {
+            throw StorageError("hot tier: invalid capacity");
         }
-        for (const NodeId id : ids) {
-            if (!store.read_adjacency(id, handle)) {
-                continue;
-            }
-            const ZeroCopyAdjView& view = handle.view();
-            builder.fill_hot(id, view);
+        slabs_ = std::make_unique<std::atomic<const GraphNodeSlab*>[]>(capacity_);
+        for (std::size_t i = 0; i < capacity_; ++i) {
+            slabs_[i].store(nullptr, std::memory_order_relaxed);
         }
-        return builder.finish();
+        node_ids_ = std::make_unique<NodeId[]>(capacity_);
+
+        map_capacity_ = 16;
+        while (map_capacity_ < capacity_ * 2) {
+            map_capacity_ <<= 1;
+        }
+        map_ = std::make_unique<MapEntry[]>(map_capacity_);
+        shift_ = 64;
+        for (std::size_t c = map_capacity_; c > 1; c >>= 1) {
+            --shift_;
+        }
     }
 
-    // Picks the `limit` highest-degree vertices (ties: lower ID wins).
-    static std::shared_ptr<const HotTier> build_top_degree(RocksDbGraphStore& store,
-                                                           std::size_t limit) {
-        using Entry = std::pair<std::uint32_t, NodeId>;  // degree, id
-        auto worse = [](const Entry& a, const Entry& b) {
-            return a.first != b.first ? a.first > b.first : a.second < b.second;
-        };
-        std::priority_queue<Entry, std::vector<Entry>, decltype(worse)> heap(worse);
-        store.for_each_adjacency([&](NodeId id, const ZeroCopyAdjView& view) {
-            const Entry entry{static_cast<std::uint32_t>(view.size()), id};
-            if (heap.size() < limit) {
-                heap.push(entry);
-            } else if (!heap.empty() && worse(heap.top(), entry)) {
-                heap.pop();
-                heap.push(entry);
-            }
-        });
-        std::vector<NodeId> ids;
-        ids.reserve(heap.size());
-        for (; !heap.empty(); heap.pop()) {
-            ids.push_back(heap.top().second);
+    HotTier(const HotTier&) = delete;
+    HotTier& operator=(const HotTier&) = delete;
+
+    ~HotTier() {
+        // Reclaim any pending EBR buckets before releasing overflow segments.
+        for (std::size_t b = 0; b < FixedSlabPool::kEpochBuckets; ++b) {
+            pool_.reclaim_epoch(b, [&](const GraphNodeSlab& node) noexcept {
+                if (node.has_overflow()) {
+                    overflow_.free(node.overflow_index);
+                }
+            });
         }
-        std::sort(ids.begin(), ids.end());
-        return build(store, ids);
+        overflow_.destroy_all();
     }
 
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+    [[nodiscard]] EpochTracker& epoch_tracker() const noexcept { return *epoch_tracker_; }
+    [[nodiscard]] std::uint64_t write_seq() const noexcept {
+        return write_seq_.load(std::memory_order_acquire);
+    }
+
+    // Lock-free lookup of an already-registered vertex.
     [[nodiscard]] LocalNodeId find(NodeId id) const noexcept {
-        if (map_.empty()) {
-            return kNotFound;
-        }
-        const std::size_t mask = map_.size() - 1;
+        const std::size_t mask = map_capacity_ - 1;
         for (std::size_t i = slot_of(id);; i = (i + 1) & mask) {
-            const MapEntry& entry = map_[i];
-            if (entry.local == kNotFound) {
+            const LocalNodeId local = map_[i].local.load(std::memory_order_acquire);
+            if (local == kNotFound) {
                 return kNotFound;
             }
-            if (entry.id == id) {
-                return entry.local;
+            if (map_[i].key == id) {
+                return local;
             }
         }
     }
 
-    [[nodiscard]] const GraphNodeSlab& slab(LocalNodeId local) const noexcept {
-        return slabs_[local];
+    // Returns the vertex's dense LocalNodeId, assigning one if capacity remains.
+    // Returns kNotFound if the vertex is unknown and capacity is exhausted.
+    [[nodiscard]] LocalNodeId ensure_local(NodeId id) {
+        if (const LocalNodeId existing = find(id); existing != kNotFound) {
+            return existing;
+        }
+        std::lock_guard lock(meta_mutex_);
+        return ensure_local_locked(id);
     }
 
-    // Hot and not invalidated since the build.
-    [[nodiscard]] bool is_servable(LocalNodeId local) const noexcept {
-        return (slabs_[local].flags & kHotFlag) != 0 &&
-               dirty_[local].load(std::memory_order_relaxed) == 0;
+    [[nodiscard]] NodeId node_id(LocalNodeId local) const noexcept {
+        return node_ids_[local];
+    }
+
+    // Returns the live 64B slab for `local`, or nullptr if not yet loaded.
+    // Caller must hold an `EpochTracker::ReadGuard` while dereferencing it.
+    [[nodiscard]] const GraphNodeSlab* slab_ptr(LocalNodeId local) const noexcept {
+        return slabs_[local].load(std::memory_order_acquire);
     }
 
     template <typename Visitor>
-    void for_each_neighbor(LocalNodeId local, Visitor&& visitor) const {
-        const GraphNodeSlab& node = slabs_[local];
+    void for_each_neighbor(const GraphNodeSlab* node, Visitor&& visitor) const {
         const std::uint32_t inline_count =
-            std::min<std::uint32_t>(node.count, node.inline_neighbors.size());
+            std::min<std::uint32_t>(node->count, node->inline_neighbors.size());
         for (std::uint32_t i = 0; i < inline_count; ++i) {
-            visitor(node.inline_neighbors[i]);
+            visitor(node->inline_neighbors[i]);
         }
-        if (node.has_overflow()) {
-            const LocalNodeId* extra = overflow_.data() + node.overflow_index;
-            const std::uint32_t extra_count = node.count - node.inline_neighbors.size();
+        if (node->has_overflow()) {
+            const LocalNodeId* extra = overflow_.get(node->overflow_index);
+            const std::uint32_t extra_count = node->count - node->inline_neighbors.size();
             for (std::uint32_t i = 0; i < extra_count; ++i) {
                 visitor(extra[i]);
             }
         }
     }
 
-    // Marks a vertex's cached row stale. Safe to call concurrently with reads.
-    void invalidate(NodeId id) const noexcept {
-        const LocalNodeId local = find(id);
-        if (local != kNotFound && (slabs_[local].flags & kHotFlag) != 0) {
-            dirty_[local].store(1, std::memory_order_relaxed);
+    // On-demand read-through population. Publishes a newly allocated slab for
+    // `local` only if no slab is loaded yet and no concurrent write invalidated
+    // `expected_write_seq`. Returns the live slab pointer, or nullptr if the
+    // row could not be cached (concurrent write or pool/ID capacity reached).
+    const GraphNodeSlab* populate_if_missing(LocalNodeId local, const ZeroCopyAdjView& view,
+                                             std::uint64_t expected_write_seq) {
+        std::lock_guard lock(meta_mutex_);
+        if (const GraphNodeSlab* existing = slabs_[local].load(std::memory_order_relaxed)) {
+            return existing;
+        }
+        if (write_seq_.load(std::memory_order_relaxed) != expected_write_seq) {
+            return nullptr;
+        }
+        if (view.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw StorageError("hot tier: degree exceeds 32 bits");
+        }
+        scratch_neighbors_.resize(view.size());
+        for (std::size_t i = 0; i < view.size(); ++i) {
+            const LocalNodeId nl = ensure_local_locked(view.target(i));
+            if (nl == kNotFound) {
+                return nullptr;
+            }
+            scratch_neighbors_[i] = nl;
+        }
+        GraphNodeSlab* slab = build_slab_locked(node_ids_[local], scratch_neighbors_);
+        if (slab == nullptr) {
+            return nullptr;
+        }
+        slabs_[local].store(slab, std::memory_order_release);
+        ++loaded_nodes_;
+        return slab;
+    }
+
+    // Live COW update after a RocksDB commit. If `src` is currently cached,
+    // swaps in a fresh 64B slab from `FixedSlabPool` and retires the old slab
+    // through EBR. Falls back to unlinking (retiring the old slab) if capacity
+    // is exhausted so stale data is never served.
+    void update_if_present(NodeId src, std::span<const NodeId> targets) {
+        std::lock_guard lock(meta_mutex_);
+        write_seq_.fetch_add(1, std::memory_order_acq_rel);
+
+        const LocalNodeId self = find(src);
+        if (self == kNotFound) {
+            return;
+        }
+        const GraphNodeSlab* current = slabs_[self].load(std::memory_order_relaxed);
+        if (current == nullptr) {
+            return;
+        }
+
+        GraphNodeSlab* replacement = nullptr;
+        if (targets.size() <= std::numeric_limits<std::uint32_t>::max()) {
+            scratch_neighbors_.resize(targets.size());
+            bool all_mapped = true;
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                const LocalNodeId nl = ensure_local_locked(targets[i]);
+                if (nl == kNotFound) {
+                    all_mapped = false;
+                    break;
+                }
+                scratch_neighbors_[i] = nl;
+            }
+            if (all_mapped) {
+                replacement = build_slab_locked(src, scratch_neighbors_);
+            }
+        }
+
+        const GraphNodeSlab* old = slabs_[self].exchange(replacement, std::memory_order_acq_rel);
+        if (replacement == nullptr && old != nullptr) {
+            --loaded_nodes_;
+        }
+        if (old != nullptr) {
+            epoch_tracker_->retire(pool_, const_cast<GraphNodeSlab*>(old));
+            reclaim_locked();
         }
     }
 
-    [[nodiscard]] std::size_t size() const noexcept { return slabs_.size(); }
-    [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    std::size_t try_reclaim() {
+        std::lock_guard lock(meta_mutex_);
+        return reclaim_locked();
+    }
+
+    [[nodiscard]] Stats stats() const {
+        std::lock_guard lock(meta_mutex_);
+        Stats s;
+        s.loaded_nodes = loaded_nodes_;
+        s.registered_nodes = next_local_;
+        s.pool_capacity = pool_.capacity();
+        s.pool_available = pool_.available();
+        s.retired_slots = pool_.retired_count();
+        s.overflow_edges = overflow_edges_;
+        s.bytes = pool_.capacity() * sizeof(SlabSlot) +
+                  capacity_ * (sizeof(std::atomic<const GraphNodeSlab*>) + sizeof(NodeId)) +
+                  map_capacity_ * sizeof(MapEntry) +
+                  overflow_edges_ * sizeof(LocalNodeId);
+        return s;
+    }
 
 private:
     struct MapEntry {
-        NodeId id{0};
-        LocalNodeId local{kNotFound};
+        NodeId key{0};
+        std::atomic<LocalNodeId> local{kNotFound};
     };
 
-    struct Builder {
-        std::vector<GraphNodeSlab> slabs;
-        std::vector<LocalNodeId> overflow;
-        std::unordered_map<NodeId, LocalNodeId> index;
-        std::size_t hot{0};
+    // Segmented table of heap-allocated overflow neighbor arrays, addressed by
+    // 32-bit `overflow_index` stored in `GraphNodeSlab`. Readers perform a
+    // single lock-free load; freed arrays are recycled only after EBR reclaim.
+    class OverflowStore {
+    public:
+        static constexpr std::size_t kSegShift = 10;
+        static constexpr std::size_t kSegSize = 1U << kSegShift;
+        static constexpr std::size_t kSegMask = kSegSize - 1;
+        static constexpr std::size_t kMaxSegs = 1024;  // up to 1,048,576 overflow arrays
 
-        LocalNodeId local_for(NodeId id) {
-            const auto [it, inserted] =
-                index.try_emplace(id, static_cast<LocalNodeId>(slabs.size()));
-            if (inserted) {
-                if (slabs.size() >= kNotFound - 1) {
-                    throw StorageError("hot tier: local ID space exhausted");
+        std::uint32_t allocate(std::span<const LocalNodeId> extra) {
+            auto* arr = new LocalNodeId[extra.size()];
+            std::copy(extra.begin(), extra.end(), arr);
+            std::uint32_t id = 0;
+            if (!free_ids_.empty()) {
+                id = free_ids_.back();
+                free_ids_.pop_back();
+            } else {
+                const std::size_t seg = next_id_ >> kSegShift;
+                if (seg >= kMaxSegs) {
+                    delete[] arr;
+                    throw StorageError("hot tier: overflow table exhausted");
                 }
-                slabs.emplace_back();
-                slabs.back().node_id = id;
-            }
-            return it->second;
-        }
-
-        void reserve_hot(NodeId id) { local_for(id); }
-
-        void fill_hot(NodeId id, const ZeroCopyAdjView& view) {
-            if (view.size() > std::numeric_limits<std::uint32_t>::max()) {
-                throw StorageError("hot tier: degree exceeds 32 bits");
-            }
-            const LocalNodeId self = local_for(id);
-            std::vector<LocalNodeId> neighbors(view.size());
-            for (std::size_t i = 0; i < view.size(); ++i) {
-                neighbors[i] = local_for(view.target(i));
-            }
-            GraphNodeSlab& node = slabs[self];  // after all local_for calls
-            node.flags |= kHotFlag;
-            node.count = static_cast<std::uint32_t>(neighbors.size());
-            const std::size_t inline_count =
-                std::min(neighbors.size(), node.inline_neighbors.size());
-            std::copy_n(neighbors.begin(), inline_count, node.inline_neighbors.begin());
-            if (neighbors.size() > inline_count) {
-                node.overflow_index = static_cast<std::uint32_t>(overflow.size());
-                overflow.insert(overflow.end(), neighbors.begin() + inline_count,
-                                neighbors.end());
-            }
-            ++hot;
-        }
-
-        std::shared_ptr<const HotTier> finish() {
-            auto tier = std::shared_ptr<HotTier>(new HotTier());
-            tier->slabs_ = std::move(slabs);
-            tier->overflow_ = std::move(overflow);
-            const std::size_t n = tier->slabs_.size();
-            tier->dirty_ = std::make_unique<std::atomic<std::uint8_t>[]>(n);
-            std::size_t capacity = 16;
-            while (capacity < n * 2) {
-                capacity <<= 1;
-            }
-            tier->map_.assign(capacity, MapEntry{});
-            tier->shift_ = 64;
-            for (std::size_t c = capacity; c > 1; c >>= 1) {
-                --tier->shift_;
-            }
-            for (std::size_t local = 0; local < n; ++local) {
-                const NodeId id = tier->slabs_[local].node_id;
-                const std::size_t mask = capacity - 1;
-                std::size_t i = tier->slot_of(id);
-                while (tier->map_[i].local != kNotFound) {
-                    i = (i + 1) & mask;
+                if (segments_[seg].load(std::memory_order_relaxed) == nullptr) {
+                    auto* block = new std::atomic<LocalNodeId*>[kSegSize];
+                    for (std::size_t i = 0; i < kSegSize; ++i) {
+                        block[i].store(nullptr, std::memory_order_relaxed);
+                    }
+                    segments_[seg].store(block, std::memory_order_release);
                 }
-                tier->map_[i] = {id, static_cast<LocalNodeId>(local)};
+                id = next_id_++;
             }
-            tier->stats_.hot_nodes = hot;
-            tier->stats_.stub_nodes = n - hot;
-            tier->stats_.overflow_edges = tier->overflow_.size();
-            tier->stats_.bytes = n * sizeof(GraphNodeSlab) +
-                                 tier->overflow_.size() * sizeof(LocalNodeId) +
-                                 capacity * sizeof(MapEntry) + n;
-            return tier;
+            auto* block = segments_[id >> kSegShift].load(std::memory_order_relaxed);
+            block[id & kSegMask].store(arr, std::memory_order_release);
+            return id;
         }
+
+        [[nodiscard]] const LocalNodeId* get(std::uint32_t id) const noexcept {
+            const auto* block = segments_[id >> kSegShift].load(std::memory_order_acquire);
+            return block[id & kSegMask].load(std::memory_order_acquire);
+        }
+
+        void free(std::uint32_t id) noexcept {
+            auto* block = segments_[id >> kSegShift].load(std::memory_order_relaxed);
+            LocalNodeId* arr = block[id & kSegMask].exchange(nullptr, std::memory_order_relaxed);
+            delete[] arr;
+            free_ids_.push_back(id);
+        }
+
+        void destroy_all() noexcept {
+            for (std::size_t s = 0; s < kMaxSegs; ++s) {
+                auto* block = segments_[s].exchange(nullptr, std::memory_order_relaxed);
+                if (block == nullptr) {
+                    continue;
+                }
+                for (std::size_t i = 0; i < kSegSize; ++i) {
+                    delete[] block[i].load(std::memory_order_relaxed);
+                }
+                delete[] block;
+            }
+            free_ids_.clear();
+            next_id_ = 0;
+        }
+
+    private:
+        std::array<std::atomic<std::atomic<LocalNodeId*>*>, kMaxSegs> segments_{};
+        std::vector<std::uint32_t> free_ids_;
+        std::uint32_t next_id_{0};
     };
-
-    HotTier() = default;
 
     std::size_t slot_of(NodeId id) const noexcept {
         return static_cast<std::size_t>((id * 0x9E3779B97F4A7C15ull) >> shift_);
     }
 
-    std::vector<GraphNodeSlab> slabs_;
-    std::vector<LocalNodeId> overflow_;
-    std::vector<MapEntry> map_;
-    std::unique_ptr<std::atomic<std::uint8_t>[]> dirty_;
+    LocalNodeId ensure_local_locked(NodeId id) {
+        if (const LocalNodeId existing = find(id); existing != kNotFound) {
+            return existing;
+        }
+        if (next_local_ >= capacity_) {
+            return kNotFound;
+        }
+        const LocalNodeId local = next_local_++;
+        node_ids_[local] = id;
+        const std::size_t mask = map_capacity_ - 1;
+        std::size_t i = slot_of(id);
+        while (map_[i].local.load(std::memory_order_relaxed) != kNotFound) {
+            i = (i + 1) & mask;
+        }
+        map_[i].key = id;
+        map_[i].local.store(local, std::memory_order_release);
+        return local;
+    }
+
+    GraphNodeSlab* build_slab_locked(NodeId id, std::span<const LocalNodeId> neighbors) {
+        GraphNodeSlab* slab = pool_.allocate();
+        if (slab == nullptr) {
+            reclaim_locked();
+            slab = pool_.allocate();
+            if (slab == nullptr) {
+                return nullptr;
+            }
+        }
+        slab->node_id = id;
+        slab->count = static_cast<std::uint32_t>(neighbors.size());
+        slab->flags = kLoadedFlag;
+        const std::size_t inline_count =
+            std::min(neighbors.size(), slab->inline_neighbors.size());
+        std::copy_n(neighbors.begin(), inline_count, slab->inline_neighbors.begin());
+        if (neighbors.size() > inline_count) {
+            const auto extra = neighbors.subspan(inline_count);
+            slab->overflow_index = overflow_.allocate(extra);
+            overflow_edges_ += extra.size();
+        }
+        return slab;
+    }
+
+    std::size_t reclaim_locked() noexcept {
+        return epoch_tracker_->try_advance(pool_, [&](const GraphNodeSlab& node) noexcept {
+            if (node.has_overflow()) {
+                overflow_.free(node.overflow_index);
+                const std::size_t extra = node.count - node.inline_neighbors.size();
+                if (overflow_edges_ >= extra) {
+                    overflow_edges_ -= extra;
+                }
+            }
+        });
+    }
+
+    std::size_t capacity_{0};
+    FixedSlabPool pool_;
+    std::shared_ptr<EpochTracker> epoch_tracker_;
+    std::unique_ptr<std::atomic<const GraphNodeSlab*>[]> slabs_;
+    std::unique_ptr<NodeId[]> node_ids_;
+    std::size_t map_capacity_{0};
+    std::unique_ptr<MapEntry[]> map_;
     std::uint32_t shift_{64};
-    Stats stats_;
+    OverflowStore overflow_;
+    std::atomic<std::uint64_t> write_seq_{0};
+
+    mutable std::mutex meta_mutex_;
+    LocalNodeId next_local_{0};
+    std::size_t loaded_nodes_{0};
+    std::size_t overflow_edges_{0};
+    std::vector<LocalNodeId> scratch_neighbors_;
 };
 
 }  // namespace low_latency_graphdb::storage

@@ -188,7 +188,7 @@ void test_tiered_graph(const std::string& path) {
     }
     store.flush();
 
-    TieredGraph graph(store);
+    TieredGraph graph(store, 2048);
     TieredBfsState state;
     TieredBfsOptions options;
     options.pin_batch_size = 5;
@@ -210,54 +210,63 @@ void test_tiered_graph(const std::string& path) {
         }
     };
 
-    check_all("cold only");
-    graph.warm_top_degree(40);
-    require(graph.hot_tier()->stats().hot_nodes == 40, "hot set size");
-    require(graph.hot_tier()->stats().overflow_edges > 0, "overflow edges stored");
-    check_all("partial hot");
+    // First pass loads vertices on demand into FixedSlabPool (no warm() needed).
+    require(graph.hot_tier().stats().loaded_nodes == 0, "starts empty before first query");
+    check_all("on-demand read-through");
+    require(graph.hot_tier().stats().loaded_nodes > 0, "slabs populated on demand");
+    require(graph.hot_tier().stats().overflow_edges > 0, "overflow edges stored");
+
+    // Subsequent queries hit 100% in FixedSlabPool without touching RocksDB.
     TieredBfsStats stats;
     options.max_depth = 2;
     (void)graph.run(0, options, state, nullptr, &stats);
-    require(stats.hot_rows > 0, "hot rows served from memory");
-    graph.warm_top_degree(kNodes);
-    check_all("all hot");
-    (void)graph.run(0, options, state, nullptr, &stats);
-    require(stats.cold_rows == 0, "fully hot query never reads RocksDB");
+    require(stats.hot_rows > 0, "hot rows served from FixedSlabPool");
+    require(stats.cold_rows == 0, "steady-state query never reads RocksDB");
 
-    // A write to a hot vertex is visible immediately and invalidates its copy.
+    // Live COW write updates the cached slab in-place and retires the old slab via EBR.
     graph.write_adjacency(0, std::vector<std::uint64_t>{499},
                           std::vector<EdgeLightMeta>(1));
     options.max_depth = 1;
     std::vector<NodeId> got;
     graph.run(0, options, state, &got);
-    require(sorted_ids(got) == (std::vector<NodeId>{0, 499}), "write visible via cold path");
+    require(sorted_ids(got) == (std::vector<NodeId>{0, 499}), "write visible immediately");
     (void)graph.run(0, options, state, nullptr, &stats);
-    require(stats.cold_rows == 1, "dirty vertex is read from RocksDB");
+    require(stats.cold_rows == 0 && stats.hot_rows == 1,
+            "updated vertex stays hot via COW without RocksDB fallback");
 
-    // Rebuilding picks the new row up again.
-    graph.warm_top_degree(kNodes);
-    (void)graph.run(0, options, state, nullptr, &stats);
-    require(stats.cold_rows == 0, "refresh clears invalidation");
-
-    // Restore vertex 0 so the reference graph is valid again.
+    // Restore vertex 0 (degree 15 exercises overflow COW + EBR reclamation).
     std::vector<std::uint64_t> original_targets;
     for (std::uint64_t c = 1; c <= 15; ++c) original_targets.push_back(c);
     graph.write_adjacency(0, original_targets,
                           std::vector<EdgeLightMeta>(original_targets.size()));
-    graph.warm_top_degree(kNodes);
+    check_all("after COW restore");
 
-    // Concurrent readers, a writer on a disjoint vertex range, and refreshes.
+    // Small-capacity pool still answers accurately via fallback without losing nodes.
+    {
+        TieredGraph small_graph(store, 20);
+        TieredBfsState small_state;
+        options.max_depth = 3;
+        std::vector<NodeId> small_got;
+        (void)small_graph.run(0, options, small_state, &small_got);
+        require(sorted_ids(small_got) ==
+                    sorted_ids(BreadthFirstSearch(reference).run(0, 3).visited),
+                "small slab pool falls back cleanly when capacity is reached");
+    }
+
+    // Concurrent readers + writer (updating both cached hot vertices and cold range).
     std::atomic<bool> stop{false};
     std::atomic<int> bad{0};
     std::thread writer([&] {
-        for (std::uint64_t v = 100'000; !stop.load(); ++v) {
-            graph.write_adjacency(v, std::vector<std::uint64_t>{v + 1},
-                                  std::vector<EdgeLightMeta>(1));
-        }
-    });
-    std::thread refresher([&] {
-        for (int i = 0; i < 20; ++i) {
-            graph.warm_top_degree(i % 2 == 0 ? 10 : 200);
+        // Repeatedly COW-update vertex 0 with its identical edges + write disjoint vertices.
+        for (std::uint64_t step = 0; !stop.load(); ++step) {
+            if ((step & 3u) == 0) {
+                graph.write_adjacency(0, original_targets,
+                                      std::vector<EdgeLightMeta>(original_targets.size()));
+            } else {
+                const std::uint64_t v = 100'000 + step;
+                graph.write_adjacency(v, std::vector<std::uint64_t>{v + 1},
+                                      std::vector<EdgeLightMeta>(1));
+            }
         }
     });
     std::vector<std::thread> readers;
@@ -273,10 +282,26 @@ void test_tiered_graph(const std::string& path) {
         });
     }
     for (auto& r : readers) r.join();
-    refresher.join();
     stop = true;
     writer.join();
-    require(bad == 0, "concurrent tiered BFS is consistent");
+    for (int i = 0; i < 3; ++i) (void)graph.hot_tier().try_reclaim();
+    require(bad == 0, "concurrent read-through and EBR COW updates are consistent");
+    require(graph.hot_tier().stats().retired_slots == 0,
+            "all retired EBR slabs reclaimed once readers exit");
+
+    // Arena hard quota guard: a tiny arena rejects a deep query and resets cleanly.
+    TieredBfsState tiny_state(64);
+    options.max_depth = 4;
+    bool arena_oom = false;
+    try {
+        (void)graph.run(0, options, tiny_state);
+    } catch (const std::runtime_error&) {
+        arena_oom = true;
+    }
+    require(arena_oom, "tiny arena enforces per-query byte quota");
+    options.max_depth = 1;
+    require(graph.run(0, options, tiny_state) == 16,
+            "arena resets cleanly after quota failure");
 }
 
 }  // namespace

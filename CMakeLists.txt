@@ -107,7 +107,8 @@ if(BUILD_TESTING)
     add_executable(low_latency_graphdb_core_tests
         tests/core_tests.cpp
     )
-    target_link_libraries(low_latency_graphdb_core_tests PRIVATE low_latency_graphdb_core)
+    find_package(Threads REQUIRED)
+    target_link_libraries(low_latency_graphdb_core_tests PRIVATE low_latency_graphdb_core Threads::Threads)
     add_test(NAME core COMMAND low_latency_graphdb_core_tests)
     add_test(NAME hot_node_correctness
         COMMAND low_latency_graphdb_hot_node_correctness_test)

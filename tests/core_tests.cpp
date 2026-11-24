@@ -4,15 +4,15 @@
 #include "low_latency_graphdb/in_memory_graph.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
 
-#include <vector>
-
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using low_latency_graphdb::EdgeLightMeta;
@@ -82,16 +82,107 @@ void test_query_arena() {
 
 void test_slab_pool() {
     static_assert(sizeof(GraphNodeSlab) == 64);
+    static_assert(sizeof(low_latency_graphdb::SlabSlot) == 64);
     FixedSlabPool pool(2);
+    require(pool.capacity() == 2);
     auto* first = pool.allocate();
     auto* second = pool.allocate();
     require(first != nullptr);
     require(second != nullptr);
+    require(reinterpret_cast<std::uintptr_t>(first) % 64 == 0);
+    require(reinterpret_cast<std::uintptr_t>(second) % 64 == 0);
+    require(pool.owns(first) && pool.owns(second));
     require(pool.allocate() == nullptr);
     pool.release(first);
     require(pool.available() == 1);
     pool.release(second);
     require(pool.available() == 2);
+
+    // Direct 3-bucket retire/reclaim.
+    auto* a = pool.allocate();
+    a->node_id = 111;
+    auto* b = pool.allocate();
+    b->node_id = 222;
+    require(pool.available() == 0);
+    pool.retire_slot(a, 0);
+    pool.retire_slot(b, 1);
+    require(pool.available() == 0);
+    require(pool.retired_count() == 2);
+    require(pool.reclaim_epoch(2) == 0);
+    require(pool.reclaim_epoch(0) == 1);
+    require(pool.available() == 1);
+    require(pool.retired_count() == 1);
+    require(pool.reclaim_epoch(1) == 1);
+    require(pool.available() == 2);
+    require(pool.retired_count() == 0);
+
+    // EpochTracker blocks reclamation while a reader holds an older epoch.
+    low_latency_graphdb::EpochTracker tracker;
+    auto reader = tracker.register_reader();
+    auto* live = pool.allocate();
+    live->node_id = 777;
+    {
+        low_latency_graphdb::EpochTracker::ReadGuard guard(tracker, reader);
+        tracker.retire(pool, live);  // retired in epoch 0 while reader is in epoch 0
+        require(tracker.try_advance(pool) == 0);  // advances 0 -> 1, epoch 0 not safe yet
+        require(tracker.current_epoch() == 1);
+        // Reader is still in epoch 0 < current_epoch(1), so epoch 1 cannot advance.
+        require(tracker.try_advance(pool) == 0);
+        require(pool.available() == 1);
+        require(live->node_id == 777);  // still untouched while reader is active
+    }
+    // Reader exited: advancing 1 -> 2 reclaims epoch 0.
+    require(tracker.try_advance(pool) == 1);
+    require(pool.available() == 2);
+    require(pool.retired_count() == 0);
+
+    // Concurrent readers + writer replacing and retiring slabs under EBR.
+    FixedSlabPool stress_pool(128);
+    low_latency_graphdb::EpochTracker stress_tracker;
+    auto* init = stress_pool.allocate();
+    init->node_id = 1;
+    init->count = 1;
+    init->inline_neighbors[0] = 42;
+    std::atomic<GraphNodeSlab*> published{init};
+    std::atomic<bool> stop{false};
+    std::atomic<int> bad{0};
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&] {
+            auto h = stress_tracker.register_reader();
+            while (!stop.load(std::memory_order_relaxed)) {
+                low_latency_graphdb::EpochTracker::ReadGuard g(stress_tracker, h);
+                const GraphNodeSlab* p = published.load(std::memory_order_acquire);
+                if (p == nullptr || p->count != 1 || p->inline_neighbors[0] != 42 ||
+                    p->node_id == 0) {
+                    ++bad;
+                }
+            }
+        });
+    }
+    for (std::uint64_t step = 2; step <= 2000; ++step) {
+        GraphNodeSlab* next = stress_pool.allocate();
+        while (next == nullptr) {
+            (void)stress_tracker.try_advance(stress_pool);
+            next = stress_pool.allocate();
+        }
+        next->node_id = step;
+        next->count = 1;
+        next->inline_neighbors[0] = 42;
+        GraphNodeSlab* old = published.exchange(next, std::memory_order_acq_rel);
+        stress_tracker.retire(stress_pool, old);
+        if ((step & 7u) == 0) {
+            (void)stress_tracker.try_advance(stress_pool);
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& r : readers) r.join();
+    require(bad.load() == 0);
+    // Drain remaining retired slots.
+    for (int i = 0; i < 3; ++i) (void)stress_tracker.try_advance(stress_pool);
+    require(stress_pool.retired_count() == 0);
+    require(stress_pool.available() == 127);  // only the currently published slab remains
 }
 
 std::vector<char> make_adjacency_buffer() {
