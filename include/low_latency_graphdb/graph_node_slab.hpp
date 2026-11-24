@@ -321,7 +321,9 @@ public:
     }
 
 private:
-    struct alignas(64) ReaderSlot {
+    // 128-byte alignment avoids false sharing on both 64B (x86-64) and 128B
+    // (Apple Silicon / ARM64) cache-line architectures.
+    struct alignas(128) ReaderSlot {
         std::atomic<std::uint64_t> epoch{kInactive};
         std::atomic<bool> in_use{false};
     };
@@ -341,7 +343,7 @@ private:
         readers_[index].in_use.store(false, std::memory_order_release);
     }
 
-    alignas(64) std::atomic<std::uint64_t> global_epoch_{0};
+    alignas(128) std::atomic<std::uint64_t> global_epoch_{0};
     std::mutex advance_mutex_;
     std::array<ReaderSlot, kMaxReaders> readers_{};
 };

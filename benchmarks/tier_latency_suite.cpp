@@ -7,7 +7,7 @@
 //   5. RocksDB hit   (StorageBreadthFirstSearch, 100% pinned BlockCache hits)
 //
 // Usage:
-//   ./build/low_latency_graphdb_tier_latency_suite [--nodes N] [--threads 1,5]
+//   ./build/low_latency_graphdb_tier_latency_suite [--nodes N] [--threads 1,2]
 //       [--queries Q] [--batch B] [--depth D] [--cache-mb M]
 
 #include "low_latency_graphdb/storage/rocksdb_graph_store.hpp"
@@ -50,7 +50,7 @@ struct Config {
     std::size_t queries{40'000};
     std::size_t batch{64};
     std::size_t cache_mb{512};
-    std::vector<std::size_t> threads{1, 5};
+    std::vector<std::size_t> threads{1, 2};
 };
 
 std::vector<std::size_t> parse_list(const std::string& text) {
@@ -132,7 +132,7 @@ struct Summary {
 template <typename Fn>
 Summary run_parallel(std::size_t threads, std::size_t queries_per_thread, std::size_t batch,
                      std::uint64_t start_range, Fn&& fn) {
-    struct ThreadData {
+    struct alignas(128) ThreadData {
         std::vector<double> samples_ns;
         std::size_t visited{0};
         std::size_t hot{0};
@@ -142,6 +142,7 @@ Summary run_parallel(std::size_t threads, std::size_t queries_per_thread, std::s
     };
     std::vector<ThreadData> data(threads);
     std::atomic<std::size_t> ready{0};
+    std::atomic<std::size_t> finished{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> workers;
     for (std::size_t t = 0; t < threads; ++t) {
@@ -149,6 +150,7 @@ Summary run_parallel(std::size_t threads, std::size_t queries_per_thread, std::s
             std::uint64_t rng = splitmix64(t + 1);
             auto& d = data[t];
             d.samples_ns.reserve(queries_per_thread / std::max<std::size_t>(1, batch) + 1);
+            std::size_t visited = 0, hot = 0, cold = 0, pinned = 0, fetched = 0;
             // Initialize thread_local state (QueryArena + DenseStampSet + ReaderHandle)
             // before timing starts.
             std::size_t dummy = 0;
@@ -165,20 +167,34 @@ Summary run_parallel(std::size_t threads, std::size_t queries_per_thread, std::s
                 }
                 const auto t0 = Clock::now();
                 for (std::size_t i = 0; i < n; ++i) {
-                    fn(starts[i], d.visited, d.hot, d.cold, d.pinned, d.fetched);
+                    fn(starts[i], visited, hot, cold, pinned, fetched);
                 }
                 const auto t1 = Clock::now();
                 d.samples_ns.push_back(
                     std::chrono::duration<double, std::nano>(t1 - t0).count() / n);
             }
+            d.visited = visited;
+            d.hot = hot;
+            d.cold = cold;
+            d.pinned = pinned;
+            d.fetched = fetched;
+            // Mark completion before thread_local destructor (munmap) runs.
+            if (finished.fetch_add(1, std::memory_order_acq_rel) + 1 == threads) {
+                finished.notify_one();
+            }
         });
     }
     while (ready.load(std::memory_order_acquire) < threads) {
+        std::this_thread::yield();
     }
     const auto wall0 = Clock::now();
     go.store(true, std::memory_order_release);
-    for (auto& w : workers) w.join();
+    for (std::size_t done = finished.load(std::memory_order_acquire); done < threads;
+         done = finished.load(std::memory_order_acquire)) {
+        finished.wait(done, std::memory_order_acquire);
+    }
     const double wall_s = std::chrono::duration<double>(Clock::now() - wall0).count();
+    for (auto& w : workers) w.join();
 
     std::vector<double> all;
     std::size_t visited = 0, hot = 0, cold = 0, pinned = 0, fetched = 0;
@@ -262,12 +278,13 @@ int main(int argc, char** argv) {
         struct TierCase {
             const char* name;
             std::uint64_t starts;
+            std::size_t query_mult;
         };
         const std::vector<TierCase> slab_cases = {
-            {"1. L1 cache", std::min<std::uint64_t>(100, cfg.nodes)},
-            {"2. L2 cache", std::min<std::uint64_t>(10'000, cfg.nodes)},
-            {"3. L3 / SLC", std::min<std::uint64_t>(150'000, cfg.nodes)},
-            {"4. SlabPool DRAM", cfg.nodes},
+            {"1. L1 cache", std::min<std::uint64_t>(100, cfg.nodes), 10},
+            {"2. L2 cache", std::min<std::uint64_t>(10'000, cfg.nodes), 5},
+            {"3. L3 / SLC", std::min<std::uint64_t>(150'000, cfg.nodes), 2},
+            {"4. SlabPool DRAM", cfg.nodes, 1},
         };
 
         for (const auto& tc : slab_cases) {
@@ -282,7 +299,7 @@ int main(int argc, char** argv) {
             }
             for (const std::size_t threads : cfg.threads) {
                 const Summary s = run_parallel(
-                    threads, cfg.queries, cfg.batch, tc.starts,
+                    threads, cfg.queries * tc.query_mult, cfg.batch, tc.starts,
                     [&](NodeId start, std::size_t& visited, std::size_t& hot, std::size_t& cold,
                         std::size_t&, std::size_t&) {
                         thread_local TieredBfsState state;
