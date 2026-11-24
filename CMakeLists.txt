@@ -88,6 +88,15 @@ if(LLG_ENABLE_ROCKSDB)
         benchmarks/rocksdb_bfs_benchmark.cpp)
     target_link_libraries(low_latency_graphdb_rocksdb_bfs_benchmark
         PRIVATE low_latency_graphdb_storage Threads::Threads)
+    add_executable(low_latency_graphdb_tier_latency_suite
+        benchmarks/tier_latency_suite.cpp)
+    target_link_libraries(low_latency_graphdb_tier_latency_suite
+        PRIVATE low_latency_graphdb_storage Threads::Threads)
+    add_custom_target(benchmark-tier-latency
+        COMMAND low_latency_graphdb_tier_latency_suite
+        DEPENDS low_latency_graphdb_tier_latency_suite
+        USES_TERMINAL
+    )
 endif()
 
 include(CTest)

@@ -92,7 +92,21 @@ Keys are encoded in **big-endian** so RocksDB's bytewise comparator orders them 
 
 ## Performance
 
-All measurements taken on **Apple M5, 10 hardware threads, 16 GiB RAM** (Release `-O2 -DNDEBUG`).
+All measurements taken on **Apple M5, 10 hardware threads, 16 GiB RAM** (P-core L1D = 128 KiB, L2 = 16 MiB; Release `-O2 -DNDEBUG`).
+
+### 5-Tier Memory & Storage Latency Suite (Depth-1 BFS)
+
+Single 2,000,000-node degree-8 graph (231.8 MiB `HotTier` in `FixedSlabPool`, 512 MiB RocksDB BlockCache), depth-1 BFS, 40,000 queries/thread, batch 64 (`./build/low_latency_graphdb_tier_latency_suite`):
+
+| Tier | Distinct starts | Active working set | 1T p50 | 1T p99 | 1T QPS | 5T p50 | 5T p99 | 5T QPS | Hit source |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---|
+| **1. L1 cache** | 100 | ~15 KiB (< 128 KiB L1D) | **12 ns** | 16 ns | 69.6M | **14 ns** | 199 ns | 73.3M | `FixedSlabPool` (100%) |
+| **2. L2 cache** | 10,000 | ~2–3 MiB (< 16 MiB L2) | **21 ns** | 35 ns | 40.6M | **27 ns** | 132 ns | 75.2M | `FixedSlabPool` (100%) |
+| **3. L3 / SLC** | 150,000 | ~30 MiB (> 16 MiB L2) | **64 ns** | 92 ns | 14.7M | **75 ns** | 263 ns | 38.4M | `FixedSlabPool` (100%) |
+| **4. SlabPool DRAM** | 2,000,000 | ~232 MiB (≫ L2/SLC) | **167 ns** | 186 ns | 5.9M | **207 ns** | 398 ns | 17.4M | `FixedSlabPool` (100%) |
+| **5. RocksDB hit** | 10,000 | RocksDB BlockCache | **729 ns** | 875 ns | 1.36M | **3,066 ns** | 5,529 ns | 1.57M | RocksDB `PinnableSlice` (100%) |
+
+Even when a random depth-1 lookup misses every CPU cache and hits main DRAM inside `FixedSlabPool` (**167 ns** 1T / **207 ns** 5T), it is still **4.4× faster (1T)** and **14.8× faster (5T)** than hitting RocksDB's DRAM BlockCache (**729 ns** / **3,066 ns**).
 
 ### Case 04 — On-Demand Read-Through `FixedSlabPool` + One-Direction `QueryArena` (No `warm()`)
 
@@ -121,6 +135,17 @@ All measurements taken on **Apple M5, 10 hardware threads, 16 GiB RAM** (Release
 | 100% uniform random all 125k internal (`--hot-pct 0`) | RocksDB only | 1T / 5T | 4,225 / 5,913 ns | 4,657 / 14,038 ns | 0.24M / 0.74M | — |
 | 100% uniform random all 125k internal (`--hot-pct 0`) | Baseline *(pre-warmed)* | 1T / 5T | 245 / 249 ns | 304 / 397 ns | 3.89M / 14.2M | — |
 | 100% uniform random all 125k internal (`--hot-pct 0`) | **New *(read-through steady)*** | **1T / 5T** | **125 / 227 ns** | **182 / 482 ns** | **7.69M / 15.7M** | **-49% / -9%** |
+
+**Depth-1 working-set & cache-hierarchy scaling (16 M-node / ~1 GiB graph, `--hot-tier 550000`, 78.2 MiB `HotTier`, steady state):**
+
+| Hot starts (`--hot-nodes`) | Loaded slabs | Active working set | Dominant cache level | Depth-1 1T p50 | Depth-1 5T p50 | RocksDB-only 1T / 5T p50 |
+|---:|---:|---|---|---:|---:|---:|
+| **1** | 1 | 64 B slab + 9 stamps | **L1 cache** | **12 ns** *(34.1M QPS)* | **13 ns** *(17.1M QPS)* | 623 / 4,648 ns |
+| **100** | 100 | ~6.4 KiB slabs + 801 stamps | **L1 cache** | **13 ns** *(50.0M QPS)* | **13 ns** *(36.6M QPS)* | 735 / 4,047 ns |
+| **10,000** | 10,000 | ~640 KiB slabs + 80k stamps + random `map_` probes | **L2 cache** | **23 ns** *(36.2M QPS)* | **28 ns** *(50.3M QPS)* | 803 / 4,143 ns |
+| **~60,000** *(full-table replay)* | ~60,000 | ~4 MiB slabs + 550k stamps + 16 MiB `map_` | **L3 / SLC** | **59–65 ns** *(~13M QPS)* | — | 1,258–1,378 ns (1T) |
+
+Latency scales cleanly with the active hot working set (L1 → L2 → L3) rather than total graph size on disk.
 
 ### Case 01 — Cache-Resident BFS Depth Sweep (10 M nodes)
 
@@ -214,6 +239,18 @@ Three test suites are registered with CTest:
 
 ## Benchmarks
 
+### 5-Tier Memory & Storage Latency Suite (Recommended)
+
+Measures steady-state depth-1 BFS latency across **L1 cache**, **L2 cache**, **L3 / SLC**, **SlabPool DRAM**, and **RocksDB BlockCache hit** in a single ~3-second run:
+
+```sh
+./build/low_latency_graphdb_tier_latency_suite
+# or via CMake:
+cmake --build build --target benchmark-tier-latency
+```
+
+Options: `--nodes N` (default 2,000,000), `--degree D` (8), `--depth H` (1), `--threads 1,5`, `--queries Q` (40,000), `--batch B` (64), `--cache-mb M` (512).
+
 ### Cache-core scan benchmark
 
 Measures raw 64-byte slab scan throughput, excluding graph lookup, query allocation, result materialization, and thread scheduling.
@@ -287,7 +324,8 @@ low_latency_graphDB/
 ├── benchmarks/
 │   ├── cache_core_benchmark.cpp
 │   ├── cache_resident_bfs_benchmark.cpp
-│   └── rocksdb_bfs_benchmark.cpp
+│   ├── rocksdb_bfs_benchmark.cpp
+│   └── tier_latency_suite.cpp        # 5-tier latency ladder (L1/L2/L3/SlabPool DRAM/RocksDB)
 ├── tests/
 │   ├── core_tests.cpp
 │   ├── hot_node_correctness.cpp

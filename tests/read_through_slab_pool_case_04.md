@@ -82,6 +82,20 @@ vertices on demand) and the 5T pass runs in steady state (100% hot hits).
 | New *(no `warm()`)* | ramp-up | 5T | 2,121 ns | 5,400 ns | 7,214 ns | 1.70M | 74.4% |
 | New *(no `warm()`)* | **steady** | **5T** | **227 ns** *(-9%)* | 430 ns | 482 ns | **15.7M** *(+11%)* | 100.0% |
 
+## Results: Depth-1 Working-Set & Cache-Hierarchy Scaling (16 M-Node / ~1 GiB Graph)
+
+16,000,000 vertices (~1.02 GiB of 64B slabs, 782 MiB RocksDB SSTs on disk),
+`--hot-tier 550000` (618,750 slab slots, 78.2 MiB total `HotTier` RAM),
+depth 1, 40,000 queries/thread, batch 64, steady state (100% hot hits on the
+active working set):
+
+| Hot starts (`--hot-nodes`) | Loaded slabs | Active working set | Dominant cache level | Depth-1 1T p50 | Depth-1 5T p50 | RocksDB-only 1T / 5T p50 |
+|---:|---:|---|---|---:|---:|---:|
+| **1** | 1 | 64 B slab + 9 stamps | **L1 cache** | **12 ns** *(34.1M QPS)* | **13 ns** *(17.1M QPS)* | 623 / 4,648 ns |
+| **100** | 100 | ~6.4 KiB slabs + 801 stamps | **L1 cache** | **13 ns** *(50.0M QPS)* | **13 ns** *(36.6M QPS)* | 735 / 4,047 ns |
+| **10,000** | 10,000 | ~640 KiB slabs + 80k stamps + random `map_` probes | **L2 cache** | **23 ns** *(36.2M QPS)* | **28 ns** *(50.3M QPS)* | 803 / 4,143 ns |
+| **~60,000** *(full-table replay)* | ~60,000 | ~4 MiB slabs + 550k stamps + 16 MiB `map_` | **L3 / SLC** | **59–65 ns** *(~13M QPS)* | — | 1,258–1,378 ns (1T) |
+
 ## Interpretation
 
 - **No upfront warm penalty**: Depth-1 and depth-2 hot-node workloads load only
