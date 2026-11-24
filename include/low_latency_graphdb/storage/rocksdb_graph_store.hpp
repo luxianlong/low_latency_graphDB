@@ -166,7 +166,7 @@ public:
     class AdjacencyHandle {
     public:
         AdjacencyHandle() = default;
-        [[nodiscard]] const ZeroCopyAdjView& view() const noexcept { return view_; }
+        [[nodiscard]] ZeroCopyAdjView view() const noexcept { return view_; }
         // True when the bytes alias a pinned block-cache page (no copy made).
         [[nodiscard]] bool is_pinned() const noexcept { return slice_.IsPinned(); }
 
@@ -348,7 +348,7 @@ public:
             std::uint64_t be{};
             std::memcpy(&be, it->key().data(), sizeof(be));
             view.reset(it->value().data(), it->value().size());
-            visitor(to_big_endian(be), static_cast<const ZeroCopyAdjView&>(view));
+            visitor(to_big_endian(be), view);
         }
         check(it->status(), "iterate cf_topo");
     }

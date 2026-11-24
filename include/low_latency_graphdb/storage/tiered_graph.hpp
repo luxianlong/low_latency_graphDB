@@ -313,7 +313,7 @@ public:
     }
 
 private:
-    void expand_view(const ZeroCopyAdjView& view, LocalNodeId*& hot_tail,
+    void expand_view(ZeroCopyAdjView view, LocalNodeId*& hot_tail,
                      const LocalNodeId* hot_limit, TieredBfsState& state) const {
         for (std::size_t j = 0; j < view.size(); ++j) {
             const NodeId target = view.target(j);

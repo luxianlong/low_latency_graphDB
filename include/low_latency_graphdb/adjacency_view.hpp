@@ -6,6 +6,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 
 namespace low_latency_graphdb {
 
@@ -34,7 +35,6 @@ public:
     void reset(const char* data, std::size_t size) {
         data_ = nullptr;
         count_ = 0;
-        aligned_ = false;
 
         if (data == nullptr || size < kHeaderSize) {
             throw std::invalid_argument("ZeroCopyAdjView: truncated header");
@@ -50,10 +50,6 @@ public:
 
         data_ = data;
         count_ = count;
-        targets_ = data + kHeaderSize;
-        metas_ = targets_ + target_bytes;
-        aligned_ = is_aligned(targets_, alignof(NodeId)) &&
-                   is_aligned(metas_, alignof(EdgeLightMeta));
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
@@ -62,32 +58,32 @@ public:
 
     // True when typed spans (targets()/edge_metas()) are available.
     [[nodiscard]] bool is_zero_copy() const noexcept {
-        return aligned_;
+        return data_ != nullptr && is_aligned(targets_ptr(), alignof(NodeId));
     }
 
     [[nodiscard]] NodeId target(std::size_t index) const {
         check_index(index);
         NodeId value{};
-        std::memcpy(&value, targets_ + index * sizeof(NodeId), sizeof(value));
+        std::memcpy(&value, targets_ptr() + index * sizeof(NodeId), sizeof(value));
         return value;
     }
 
     [[nodiscard]] EdgeLightMeta meta(std::size_t index) const {
         check_index(index);
         EdgeLightMeta value{};
-        std::memcpy(&value, metas_ + index * sizeof(EdgeLightMeta), sizeof(value));
+        std::memcpy(&value, metas_ptr() + index * sizeof(EdgeLightMeta), sizeof(value));
         return value;
     }
 
     // Typed spans; only valid for naturally aligned payloads (is_zero_copy()).
     [[nodiscard]] std::span<const NodeId> targets() const {
         require_aligned();
-        return {reinterpret_cast<const NodeId*>(targets_), count_};
+        return {reinterpret_cast<const NodeId*>(targets_ptr()), count_};
     }
 
     [[nodiscard]] std::span<const EdgeLightMeta> edge_metas() const {
         require_aligned();
-        return {reinterpret_cast<const EdgeLightMeta*>(metas_), count_};
+        return {reinterpret_cast<const EdgeLightMeta*>(metas_ptr()), count_};
     }
 
 private:
@@ -122,16 +118,26 @@ private:
     }
 
     void require_aligned() const {
-        if (!aligned_) {
+        if (!is_zero_copy()) {
             throw std::logic_error("ZeroCopyAdjView: payload is unaligned; use target(i)/meta(i)");
         }
     }
 
+    // targets/metas pointers and alignment are derived from data_ + count_, so
+    // the view stays 16 bytes and trivially copyable (passed in two registers
+    // under the System V AMD64 ABI). targets and metas share 8-byte alignment
+    // because the target array is a multiple of 8 bytes long.
+    [[nodiscard]] const char* targets_ptr() const noexcept { return data_ + kHeaderSize; }
+    [[nodiscard]] const char* metas_ptr() const noexcept {
+        return data_ + kHeaderSize + static_cast<std::size_t>(count_) * sizeof(NodeId);
+    }
+
     const char* data_{nullptr};
-    const char* targets_{nullptr};
-    const char* metas_{nullptr};
-    std::size_t count_{0};
-    bool aligned_{false};
+    std::uint32_t count_{0};
+    [[maybe_unused]] std::uint32_t reserved_{0};
 };
+
+static_assert(sizeof(ZeroCopyAdjView) == 16, "ZeroCopyAdjView must stay a 16-byte register-passed view");
+static_assert(std::is_trivially_copyable_v<ZeroCopyAdjView>);
 
 }  // namespace low_latency_graphdb

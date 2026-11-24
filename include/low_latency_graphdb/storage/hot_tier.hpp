@@ -142,7 +142,7 @@ public:
     // `local` only if no slab is loaded yet and no concurrent write invalidated
     // `expected_write_seq`. Returns the live slab pointer, or nullptr if the
     // row could not be cached (concurrent write or pool/ID capacity reached).
-    const GraphNodeSlab* populate_if_missing(LocalNodeId local, const ZeroCopyAdjView& view,
+    const GraphNodeSlab* populate_if_missing(LocalNodeId local, ZeroCopyAdjView view,
                                              std::uint64_t expected_write_seq) {
         std::lock_guard lock(meta_mutex_);
         if (const GraphNodeSlab* existing = slabs_[local].load(std::memory_order_relaxed)) {
