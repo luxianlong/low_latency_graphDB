@@ -12,10 +12,6 @@
 
 * 已访问哈希集合、BFS 边沿队列、路径追踪节点以及中间聚合缓冲区仅在单次查询执行期间（1ms 至 10ms）有效，响应序列化完成后立即变为 100% 垃圾内存。
 
-### **1.1.3 幂律度分布带来的极端负载倾斜**
-
-* 99% 的图顶点出度小于或等于 20，而 0.1% 的超级节点（例如根目录、全局 Schema 定义）拥有百万级出度，导致单次查询内部产生高达 1000 倍的突发内存空间剧增。
-
 ## **1.2 通用内存分配器在热路径上的五大根因问题（Problem Statement）**
 
 ### **1.2.1 问题一：外部堆碎片导致 RSS 持续膨胀**
@@ -49,7 +45,7 @@
 ### **1.2.5 问题五：缺乏单查询粒度的硬性内存隔离与熔断机制**
 
 * **机制剖析与物理后果：病态查询拖垮整个进程**  
-  * 全局 new / malloc 没有单请求计数器。当某个病态查询遇到了包含 500 万条边的超级节点时，它会无休止地申请内存，吃光整台机器的物理内存，导致整个图数据库服务节点被系统强行杀掉，影响同节点上的所有健康请求。
+  * 全局 new / malloc 没有单请求计数器。当某个病态查询失控时，它会无休止地申请内存，吃光整台机器的物理内存，导致整个图数据库服务节点被系统强行杀掉，影响同节点上的所有健康请求。
 
 ## **1.3 硬件物理约束与服务等级目标（Constraints）**
 
@@ -96,37 +92,32 @@
 |  |                   Compute Domain                    |  |
 |  |  +-----------------------------------------------+  |  |
 |  |  | Worker Thread 0 (Thread-Local QueryArena)     |  |  |
-|  |  |  [Primary Chunk 4MB] -> [Overflow Chunk 4MB]  |  |  |
-|  |  |  Quota Guard: Capped at 16MB                    |  |  |
+|  |  |  [Primary Chunk 16MB]                         |  |  |
+|  |  |  Quota Guard: Capped at 16MB (= chunk size)    |  |  |
 |  |  +-----------------------------------------------+  |  |
 |  +-----------------------------------------------------+  |
 +-----------------------------------------------------------+
 ```
 
-## **2.2 双层 Chunk 内存管理模型（Two-Tier Chunk Model）**
+## **2.2 单块内存管理模型（Single-Chunk Model）**
 
-### **2.2.1 第一层：常驻主块（Primary Resident Chunk — 4MB）**
+### **2.2.1 常驻主块（Primary Resident Chunk — 16MB）**
 
 * 分配、预热与零开销重置  
-  * 工作线程启动时预分配 4MB 并完成写触碰预热，满足 99.5% 的日常查询。查询结束时游标直接归零，物理页持续驻留在 CPU 缓存与 TLB 中。
-
-### **2.2.2 第二层：受控溢出扩展块（Bounded Overflow Chunks）**
-
-* 动态扩展与剥离策略  
-  * 遇到超级节点突发时，以 4MB 为步长动态挂接扩展块（受 16MB 配额约束）。查询结束后解绑并释放扩展块，防止常驻内存基线被永久拉高。
+  * 工作线程启动时预分配 16MB 并完成写触碰预热，满足日常查询。查询结束时游标直接归零，物理页持续驻留在 CPU 缓存与 TLB 中。主块容量同时是单查询的硬性内存配额，超出即熔断，不做动态扩展。
 
 ## **2.3 完整查询生命周期状态机（Query Lifecycle State Flow）**
 
 * 阶段一：线程启动初始化（Thread Init）  
-  * 申请 64 字节对齐的 4MB 常驻主块，逐页写触碰以消除运行期缺页中断。  
+  * 申请 64 字节对齐的 16MB 常驻主块，逐页写触碰以消除运行期缺页中断。  
 * 阶段二：查询进入绑定（Query Begin）  
   * 校验 used\_bytes\_ \== 0，将当前线程的 QueryArena 句柄绑定至请求上下文。  
 * 阶段三：热路径线性分配（Hot-Path Bump Allocation）  
   * 算子调用 allocate(bytes, align)，在 2ns 内完成位运算对齐与指针递增。  
 * 阶段四：配额熔断保护（Quota Guard Trigger）  
-  * 若请求总额超过 16MB 硬性配额，拒绝分配并抛出异常安全熔断。  
+  * 若请求超出 16MB 主块容量（即单查询硬性配额），拒绝分配并抛出异常安全熔断，不做动态扩展。
 * 阶段五：查询结束 O(1) 重置（Query End Reset）  
-  * 解绑溢出块，重置主块指针游标为 0。
+  * 重置主块指针游标为 0（Debug 模式下同时毒化）。
 
 ## **2.4 关键工程权衡与失效模式防护（Trade-offs & Failure Modes）**
 
@@ -154,66 +145,50 @@
 #include <type_traits>
 #include <utility>
 
-// 溢出扩展 Chunk 链表节点
-struct ChunkNode {
-    char* buffer{nullptr};
-    size_t capacity{0};
-    size_t offset{0};
-    ChunkNode* next{nullptr};
-};
-
 class QueryArena {
 public:
     static constexpr size_t kCacheLineAlignment = 64; // 64字节缓存行对齐
     static constexpr size_t kPageSize = 4096;          // 操作系统4KB页大小
-    static constexpr size_t kDefaultPrimaryCapacity = 4 * 1024 * 1024; // 默认4MB主块
+    static constexpr size_t kDefaultCapacity = 16 * 1024 * 1024; // 默认16MB主块，同时是单查询硬性配额
 
-    explicit QueryArena(size_t primary_capacity = kDefaultPrimaryCapacity,
-                        size_t max_quota_bytes = 16 * 1024 * 1024)
-        : primary_capacity_(primary_capacity),
-          max_quota_bytes_(max_quota_bytes),
-          primary_offset_(0),
-          used_bytes_(0) {
+    explicit QueryArena(size_t capacity = kDefaultCapacity)
+        : capacity_(capacity), offset_(0) {
         // 向系统申请 64 字节缓存行边界对齐的内存
         void* ptr = nullptr;
-        if (posix_memalign(&ptr, kCacheLineAlignment, primary_capacity_) != 0) {
+        if (posix_memalign(&ptr, kCacheLineAlignment, capacity_) != 0) {
             throw std::bad_alloc();
         }
-        primary_buffer_ = static_cast<char*>(ptr);
+        buffer_ = static_cast<char*>(ptr);
         // 线程启动预热触碰，提前向物理页写0，消除运行期缺页中断
-        pre_fault_pages(primary_buffer_, primary_capacity_);
+        pre_fault_pages(buffer_, capacity_);
     }
 
-    ~QueryArena() {
-        free_overflow_chunks(overflow_head_);
-        std::free(primary_buffer_);
-    }
+    ~QueryArena() { std::free(buffer_); }
 
     QueryArena(const QueryArena&) = delete;
     QueryArena& operator=(const QueryArena&) = delete;
 
+    // 查询进入：要求上一次查询已 reset
+    void begin_query() const {
+        if (offset_ != 0) {
+            throw std::logic_error("QueryArena: begin_query on a non-reset arena");
+        }
+    }
+
     // 热路径线性递增分配核心算法
     void* allocate(size_t bytes, size_t alignment = 8) {
-        // 校验单查询硬性字节配额
-        if (used_bytes_ + bytes > max_quota_bytes_) {
+        uintptr_t current_addr = reinterpret_cast<uintptr_t>(buffer_ + offset_);
+        // 快速位掩码计算向上取整对齐地址
+        uintptr_t aligned_addr = (current_addr + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
+        size_t padding = aligned_addr - current_addr;
+        size_t remaining = capacity_ - offset_;
+
+        // 单查询硬性配额：主块容量即上限，放不下直接熔断，不扩展
+        if (padding > remaining || bytes > remaining - padding) {
             throw std::runtime_error("STATUS_QUERY_MEMORY_LIMIT_EXCEEDED");
         }
-
-        // 优先在常驻主块分配
-        if (current_chunk_ == nullptr) {
-            uintptr_t current_addr = reinterpret_cast<uintptr_t>(primary_buffer_ + primary_offset_);
-            // 快速位掩码计算向上取整对齐地址
-            uintptr_t aligned_addr = (current_addr + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
-            size_t padding = aligned_addr - current_addr;
-            size_t total_needed = bytes + padding;
-
-            if (primary_offset_ + total_needed <= primary_capacity_) {
-                primary_offset_ += total_needed; // 游标加法递增
-                used_bytes_ += total_needed;
-                return reinterpret_cast<void*>(aligned_addr);
-            }
-        }
-        return allocate_overflow(bytes, alignment);
+        offset_ += padding + bytes; // 游标加法递增
+        return reinterpret_cast<void*>(aligned_addr);
     }
 
     // 静态安检门控制的对象就地构造函数
@@ -231,16 +206,13 @@ public:
     void reset() noexcept {
         // Debug 模式下全区写入 0xCD 进行毒化，用于即时检测野指针
 #ifndef NDEBUG
-        std::memset(primary_buffer_, 0xCD, primary_capacity_);
+        std::memset(buffer_, 0xCD, capacity_);
 #endif
-        primary_offset_ = 0; // 游标直接归零
-        used_bytes_ = 0;
-        if (overflow_head_ != nullptr) {
-            free_overflow_chunks(overflow_head_);
-            overflow_head_ = nullptr;
-            current_chunk_ = nullptr;
-        }
+        offset_ = 0; // 游标直接归零
     }
+
+    size_t used_bytes() const noexcept { return offset_; }
+    size_t capacity() const noexcept { return capacity_; }
 
 private:
     void pre_fault_pages(char* buffer, size_t size) {
@@ -250,27 +222,25 @@ private:
         }
     }
 
-    void* allocate_overflow(size_t bytes, size_t alignment) {
-        // 溢出扩展分配逻辑（略）
-        return nullptr;
-    }
+    char* buffer_{nullptr};
+    size_t capacity_{0};
+    size_t offset_{0};
+};
 
-    void free_overflow_chunks(ChunkNode* head) {
-        while (head != nullptr) {
-            ChunkNode* next = head->next;
-            std::free(head->buffer);
-            delete head;
-            head = next;
-        }
-    }
+// 每线程一个 arena，首次使用时创建并预热；查询结束由 ArenaScope 自动 reset
+inline QueryArena& thread_arena() {
+    static thread_local QueryArena arena;
+    return arena;
+}
 
-    char* primary_buffer_{nullptr};
-    size_t primary_capacity_{0};
-    size_t max_quota_bytes_{0};
-    size_t primary_offset_{0};
-    size_t used_bytes_{0};
-    ChunkNode* overflow_head_{nullptr};
-    ChunkNode* current_chunk_{nullptr};
+class ArenaScope {
+public:
+    explicit ArenaScope(QueryArena& arena) : arena_(arena) { arena_.begin_query(); }
+    ~ArenaScope() { arena_.reset(); } // 含异常路径
+    ArenaScope(const ArenaScope&) = delete;
+    ArenaScope& operator=(const ArenaScope&) = delete;
+private:
+    QueryArena& arena_;
 };
 
 // STL 标准分配器适配器
@@ -279,6 +249,8 @@ class ArenaAllocator {
 public:
     using value_type = T;
     explicit ArenaAllocator(QueryArena* arena) noexcept : arena_(arena) {}
+    template <typename U>
+    ArenaAllocator(const ArenaAllocator<U>& other) noexcept : arena_(other.arena()) {}
 
     T* allocate(size_t n) {
         return static_cast<T*>(arena_->allocate(n * sizeof(T), alignof(T)));
@@ -286,6 +258,10 @@ public:
     void deallocate(T*, size_t) noexcept {
         // 单个 deallocate 空操作化，不做任何事情
     }
+    QueryArena* arena() const noexcept { return arena_; }
+    template <typename U> bool operator==(const ArenaAllocator<U>& o) const noexcept { return arena_ == o.arena(); }
+    template <typename U> bool operator!=(const ArenaAllocator<U>& o) const noexcept { return arena_ != o.arena(); }
+private:
     QueryArena* arena_{nullptr};
 };
 ```
@@ -318,6 +294,6 @@ public:
 * **自研引擎职责二：运行时缺页中断消除**  
   * 在线程初始化阶段完成 4KB 物理页预热触碰，保证查询热路径零内核缺页阻塞。  
 * **自研引擎职责三：单查询硬性配额熔断**  
-  * 在每次分配前执行字节级累计校验，防止超级节点查询引发整机 OOM。  
+  * 在每次分配前执行字节级累计校验，防止病态查询引发整机 OOM。  
 * **自研引擎职责四：编译期析构安全校验与内存毒化**  
   * 通过 is\_trivially\_destructible\_v 约束防止持有外部资源句柄的对象误入内存池，并在 Debug 重置阶段填充 0xCD 快速暴露悬空指针。

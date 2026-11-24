@@ -15,7 +15,7 @@ int main() {
         low_latency_graphdb::BreadthFirstSearch(graph).run(1, 2);
 
     std::cout << "low_latency_graphDB initialized "
-              << "(arena_quota=" << arena.quota()
+              << "(arena_capacity=" << arena.capacity()
               << ", hot_node_capacity=" << 1024
               << ", traversal_nodes=" << traversal.visited.size() << ")\n";
     return 0;

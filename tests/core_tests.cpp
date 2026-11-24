@@ -4,6 +4,8 @@
 #include "low_latency_graphdb/in_memory_graph.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
 
+#include <vector>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -28,19 +30,31 @@ void require(bool condition) {
 }
 
 void test_query_arena() {
-    QueryArena arena(128, 512);
+    QueryArena arena(512);
+    require(arena.capacity() == 512);
+    arena.begin_query();
     auto* first = static_cast<std::uint64_t*>(arena.allocate(sizeof(std::uint64_t), alignof(std::uint64_t)));
     require(reinterpret_cast<std::uintptr_t>(first) % alignof(std::uint64_t) == 0);
     *first = 42;
     require(*first == 42);
 
-    auto* overflow = arena.allocate(200, 64);
-    require(overflow != nullptr);
-    require(arena.used_bytes() >= 200);
+    auto* line = arena.allocate(64, 64);
+    require(reinterpret_cast<std::uintptr_t>(line) % 64 == 0);
+    require(arena.used_bytes() >= 72);
+
+    bool begin_failed = false;
+    try {
+        arena.begin_query();
+    } catch (const std::logic_error&) {
+        begin_failed = true;
+    }
+    require(begin_failed);
 
     arena.reset();
     require(arena.used_bytes() == 0);
+    arena.begin_query();
 
+    // Capacity is the hard quota: no growth, the request is refused.
     bool quota_failed = false;
     try {
         (void)arena.allocate(513, 1);
@@ -48,6 +62,22 @@ void test_query_arena() {
         quota_failed = true;
     }
     require(quota_failed);
+    require(arena.used_bytes() == 0);
+
+    // STL adapter draws from the arena; ArenaScope resets it on exit.
+    QueryArena pool(1U << 20);
+    {
+        low_latency_graphdb::ArenaScope scope(pool);
+        std::vector<int, low_latency_graphdb::ArenaAllocator<int>> values{
+            low_latency_graphdb::ArenaAllocator<int>(&pool)};
+        for (int i = 0; i < 100; ++i) {
+            values.push_back(i);
+        }
+        require(values[99] == 99);
+        require(pool.used_bytes() > 0);
+    }
+    require(pool.used_bytes() == 0);
+    require(&low_latency_graphdb::thread_arena() == &low_latency_graphdb::thread_arena());
 }
 
 void test_slab_pool() {

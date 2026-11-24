@@ -27,7 +27,8 @@ public:
             return result;
         }
 
-        QueryArena arena;
+        QueryArena& arena = thread_arena();
+        ArenaScope arena_scope(arena);
         const std::size_t node_count = graph_.size();
         auto* queue = static_cast<LocalNodeId*>(
             arena.allocate(node_count * sizeof(LocalNodeId), alignof(LocalNodeId)));

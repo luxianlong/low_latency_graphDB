@@ -2,6 +2,7 @@
 
 #include "low_latency_graphdb/generation_set.hpp"
 #include "low_latency_graphdb/hot_tier.hpp"
+#include "low_latency_graphdb/query_arena.hpp"
 #include "low_latency_graphdb/storage_bfs.hpp"
 
 #include <algorithm>
@@ -49,8 +50,13 @@ private:
     std::shared_ptr<const HotTier> tier;
     DenseStampSet seen_local;    // keyed by hot-tier local ID
     GenerationSet seen_dynamic;  // keyed by NodeId, for vertices unknown to the tier
-    std::vector<LocalNodeId> hot_cur, hot_next;
-    std::vector<NodeId> cold_cur, cold_next;
+    // Per-thread arena for the transient frontier buffers; reset after every
+    // query (design doc 01). Created lazily so default-constructed states stay cheap.
+    std::unique_ptr<QueryArena> arena;
+    // Peak frontier sizes of earlier queries, used to reserve arena space up
+    // front so steady-state queries never regrow (and re-copy) their buffers.
+    std::size_t hot_peak{0};
+    std::size_t cold_peak{0};
     RocksDbGraphStore::AdjacencyBatch batch;
     ZeroCopyAdjView view;
 };
@@ -114,17 +120,33 @@ public:
 
         state.seen_local.clear();
         state.seen_dynamic.clear();
-        state.hot_cur.clear();
-        state.hot_next.clear();
-        state.cold_cur.clear();
-        state.cold_next.clear();
+
+        // Frontier buffers live in the per-thread arena: bump allocation, no
+        // free, O(1) reset when the scope ends (also on exceptions).
+        if (!state.arena) {
+            state.arena = std::make_unique<QueryArena>();
+        }
+        ArenaScope arena_scope(*state.arena);
+        using LocalVec = std::vector<LocalNodeId, ArenaAllocator<LocalNodeId>>;
+        using NodeVec = std::vector<NodeId, ArenaAllocator<NodeId>>;
+        LocalVec hot_cur{ArenaAllocator<LocalNodeId>(state.arena.get())};
+        LocalVec hot_next{ArenaAllocator<LocalNodeId>(state.arena.get())};
+        NodeVec cold_cur{ArenaAllocator<NodeId>(state.arena.get())};
+        NodeVec cold_next{ArenaAllocator<NodeId>(state.arena.get())};
+        if (state.hot_peak != 0) {
+            hot_cur.reserve(state.hot_peak);
+            hot_next.reserve(state.hot_peak);
+        }
+        if (state.cold_peak != 0) {
+            cold_cur.reserve(state.cold_peak);
+            cold_next.reserve(state.cold_peak);
+        }
 
         TieredBfsStats local;
         std::optional<RocksDbGraphStore::Snapshot> snapshot;
 
         // Places a vertex (already marked seen) into the next frontier.
-        auto enqueue_local = [&](LocalNodeId nl, std::vector<LocalNodeId>& hot,
-                                 std::vector<NodeId>& cold) {
+        auto enqueue_local = [&](LocalNodeId nl, LocalVec& hot, NodeVec& cold) {
             if (tier.is_servable(nl)) {
                 hot.push_back(nl);
             } else {
@@ -135,16 +157,14 @@ public:
         const LocalNodeId start_local = tier.find(start);
         if (start_local != HotTier::kNotFound) {
             state.seen_local.insert(start_local);
-            enqueue_local(start_local, state.hot_cur, state.cold_cur);
+            enqueue_local(start_local, hot_cur, cold_cur);
         } else {
             state.seen_dynamic.insert(start);
-            state.cold_cur.push_back(start);
+            cold_cur.push_back(start);
         }
 
         std::size_t visited = 0;
         for (std::size_t depth = 0;; ++depth) {
-            auto& hot_cur = state.hot_cur;
-            auto& cold_cur = state.cold_cur;
             const std::size_t level = hot_cur.size() + cold_cur.size();
             if (level == 0) {
                 break;
@@ -165,8 +185,8 @@ public:
             // no ID output is requested, which avoids touching their slabs.
             const bool count_only_leaves = out == nullptr && depth + 1 >= options.max_depth;
             std::size_t leaves = 0;
-            state.hot_next.clear();
-            state.cold_next.clear();
+            hot_next.clear();
+            cold_next.clear();
 
             for (const LocalNodeId l : hot_cur) {
                 ++local.hot_rows;
@@ -177,7 +197,7 @@ public:
                     if (count_only_leaves) {
                         ++leaves;
                     } else {
-                        enqueue_local(nl, state.hot_next, state.cold_next);
+                        enqueue_local(nl, hot_next, cold_next);
                     }
                 });
             }
@@ -208,13 +228,13 @@ public:
                             if (count_only_leaves) {
                                 ++leaves;
                             } else {
-                                enqueue_local(nl, state.hot_next, state.cold_next);
+                                enqueue_local(nl, hot_next, cold_next);
                             }
                         } else if (state.seen_dynamic.insert(target)) {
                             if (count_only_leaves) {
                                 ++leaves;
                             } else {
-                                state.cold_next.push_back(target);
+                                cold_next.push_back(target);
                             }
                         }
                     }
@@ -229,8 +249,10 @@ public:
                 visited += leaves;
                 break;
             }
-            hot_cur.swap(state.hot_next);
-            cold_cur.swap(state.cold_next);
+            state.hot_peak = std::max(state.hot_peak, hot_next.size());
+            state.cold_peak = std::max(state.cold_peak, cold_next.size());
+            hot_cur.swap(hot_next);
+            cold_cur.swap(cold_next);
         }
 
         local.visited = visited;
