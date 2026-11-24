@@ -1,6 +1,5 @@
 #pragma once
 
-#include "low_latency_graphdb/generation_set.hpp"
 #include "low_latency_graphdb/query_arena.hpp"
 #include "low_latency_graphdb/storage/hot_tier.hpp"
 #include "low_latency_graphdb/storage/storage_bfs.hpp"
@@ -40,16 +39,10 @@ public:
     explicit TieredBfsState(std::size_t arena_capacity = QueryArena::kDefaultCapacity)
         : arena_capacity_(arena_capacity) {}
 
-    void reserve(std::size_t expected_visited) {
-        seen_dynamic.reserve(expected_visited / 4 + 16);
-    }
-
 private:
     friend class TieredGraph;
     const TieredGraph* owner{nullptr};
     EpochTracker::ReaderHandle reader_handle;
-    DenseStampSet seen_local;    // keyed by hot-tier LocalNodeId
-    GenerationSet seen_dynamic;  // fallback for vertices beyond HotTier capacity
     // Per-thread arena providing the one-direction raw frontier queue;
     // reset after every query (design doc 01).
     std::size_t arena_capacity_{QueryArena::kDefaultCapacity};
@@ -57,6 +50,8 @@ private:
     // Reusable scratch for on-demand cache misses (untouched on steady-state hits).
     std::vector<std::pair<NodeId, LocalNodeId>> miss_locals;
     std::vector<NodeId> miss_ids;
+    std::vector<LocalNodeId> miss_unique_locals;
+    std::vector<std::size_t> miss_counts;
     std::vector<NodeId> cold_cur, cold_next;
     RocksDbGraphStore::AdjacencyBatch batch;
     ZeroCopyAdjView view;
@@ -87,15 +82,15 @@ public:
         tier_.update_if_present(src, targets);
     }
 
-    // Visits the subgraph within `max_depth` hops. When `out` is non-null the
-    // visited IDs are appended (level by level, unspecified order within a
-    // level); otherwise only the count is produced. Returns the visited count.
+    // Traverses all paths within `max_depth` hops (level by level, allowing
+    // duplicate visits — no visited set is maintained). When `out` is non-null
+    // the visited IDs are appended (unspecified order within a level); otherwise
+    // only the visit count is produced. Returns the total visit count.
     std::size_t run(NodeId start, const TieredBfsOptions& options, TieredBfsState& state,
                     std::vector<NodeId>* out = nullptr,
                     TieredBfsStats* stats = nullptr) const {
         if (state.owner != this) {
             state.reader_handle = tier_.epoch_tracker().register_reader();
-            state.seen_local.resize(tier_.capacity());
             state.owner = this;
         }
         EpochTracker::ReadGuard epoch_guard(tier_.epoch_tracker(), state.reader_handle);
@@ -103,8 +98,6 @@ public:
         const std::size_t chunk = std::clamp<std::size_t>(
             options.pin_batch_size, 1, RocksDbGraphStore::kMaxPinBatchSize);
 
-        state.seen_local.clear();
-        state.seen_dynamic.clear();
         state.cold_cur.clear();
         state.cold_next.clear();
 
@@ -133,10 +126,8 @@ public:
 
         const LocalNodeId start_local = tier_.ensure_local(start);
         if (start_local != HotTier::kNotFound) {
-            state.seen_local.insert(start_local);
             push_hot(hot_tail, hot_limit, start_local);
         } else {
-            state.seen_dynamic.insert(start);
             state.cold_cur.push_back(start);
         }
         hot_cur_end = hot_tail;
@@ -182,11 +173,7 @@ public:
                         continue;
                     }
                     ++local.hot_rows;
-                    tier_.for_each_neighbor(node, [&](LocalNodeId nl) {
-                        if (state.seen_local.insert(nl)) {
-                            ++leaves;
-                        }
-                    });
+                    leaves += node->count;
                 }
             } else {
                 for (const LocalNodeId* p = hot_cur_begin; p != hot_cur_end; ++p) {
@@ -198,9 +185,7 @@ public:
                     }
                     ++local.hot_rows;
                     tier_.for_each_neighbor(node, [&](LocalNodeId nl) {
-                        if (state.seen_local.insert(nl)) {
-                            push_hot(hot_tail, hot_limit, nl);
-                        }
+                        push_hot(hot_tail, hot_limit, nl);
                     });
                 }
             }
@@ -213,40 +198,53 @@ public:
                     snapshot_seq = tier_.write_seq();
                     snapshot.emplace(store_.snapshot());
                 }
-                const std::size_t miss_n = state.miss_locals.size();
-                state.miss_ids.resize(miss_n);
-                for (std::size_t i = 0; i < miss_n; ++i) {
-                    state.miss_ids[i] = state.miss_locals[i].first;
+                // Coalesce duplicate misses so RocksDB MultiGet receives sorted unique
+                // keys while preserving exact duplicate-visit multiplicity.
+                state.miss_ids.clear();
+                state.miss_unique_locals.clear();
+                state.miss_counts.clear();
+                for (const auto& [nid, loc] : state.miss_locals) {
+                    if (!state.miss_ids.empty() && state.miss_ids.back() == nid) {
+                        ++state.miss_counts.back();
+                    } else {
+                        state.miss_ids.push_back(nid);
+                        state.miss_unique_locals.push_back(loc);
+                        state.miss_counts.push_back(1);
+                    }
                 }
+                const std::size_t miss_n = state.miss_ids.size();
                 for (std::size_t offset = 0; offset < miss_n; offset += chunk) {
                     const std::size_t count = std::min(chunk, miss_n - offset);
                     store_.read_adjacency_batch(
                         std::span<const NodeId>(state.miss_ids.data() + offset, count),
                         state.batch, &*snapshot);
                     for (std::size_t i = 0; i < state.batch.size(); ++i) {
+                        const std::size_t mult = state.miss_counts[offset + i];
                         if (!state.batch.found(i)) {
-                            ++local.cold_missing;
+                            local.cold_missing += mult;
                             continue;
                         }
-                        ++local.cold_rows;
+                        local.cold_rows += mult;
                         state.batch.bind(i, state.view);
-                        const LocalNodeId cur_local = state.miss_locals[offset + i].second;
+                        const LocalNodeId cur_local = state.miss_unique_locals[offset + i];
                         const GraphNodeSlab* loaded =
                             tier_.populate_if_missing(cur_local, state.view, snapshot_seq);
                         if (loaded != nullptr) {
-                            tier_.for_each_neighbor(loaded, [&](LocalNodeId nl) {
-                                if (!state.seen_local.insert(nl)) {
-                                    return;
+                            if (count_only_leaves) {
+                                leaves += mult * loaded->count;
+                            } else {
+                                for (std::size_t rep = 0; rep < mult; ++rep) {
+                                    tier_.for_each_neighbor(loaded, [&](LocalNodeId nl) {
+                                        push_hot(hot_tail, hot_limit, nl);
+                                    });
                                 }
-                                if (count_only_leaves) {
-                                    ++leaves;
-                                } else {
-                                    push_hot(hot_tail, hot_limit, nl);
-                                }
-                            });
+                            }
+                        } else if (count_only_leaves) {
+                            leaves += mult * state.view.size();
                         } else {
-                            expand_view(state.view, count_only_leaves, leaves, hot_tail,
-                                        hot_limit, state);
+                            for (std::size_t rep = 0; rep < mult; ++rep) {
+                                expand_view(state.view, hot_tail, hot_limit, state);
+                            }
                         }
                     }
                     state.batch.clear();
@@ -259,20 +257,37 @@ public:
                 if (!snapshot) {
                     snapshot.emplace(store_.snapshot());
                 }
-                for (std::size_t offset = 0; offset < cold_count; offset += chunk) {
-                    const std::size_t count = std::min(chunk, cold_count - offset);
+                state.miss_ids.clear();
+                state.miss_counts.clear();
+                for (const NodeId nid : state.cold_cur) {
+                    if (!state.miss_ids.empty() && state.miss_ids.back() == nid) {
+                        ++state.miss_counts.back();
+                    } else {
+                        state.miss_ids.push_back(nid);
+                        state.miss_counts.push_back(1);
+                    }
+                }
+                const std::size_t unique_cold = state.miss_ids.size();
+                for (std::size_t offset = 0; offset < unique_cold; offset += chunk) {
+                    const std::size_t count = std::min(chunk, unique_cold - offset);
                     store_.read_adjacency_batch(
-                        std::span<const NodeId>(state.cold_cur.data() + offset, count),
+                        std::span<const NodeId>(state.miss_ids.data() + offset, count),
                         state.batch, &*snapshot);
                     for (std::size_t i = 0; i < state.batch.size(); ++i) {
+                        const std::size_t mult = state.miss_counts[offset + i];
                         if (!state.batch.found(i)) {
-                            ++local.cold_missing;
+                            local.cold_missing += mult;
                             continue;
                         }
-                        ++local.cold_rows;
+                        local.cold_rows += mult;
                         state.batch.bind(i, state.view);
-                        expand_view(state.view, count_only_leaves, leaves, hot_tail, hot_limit,
-                                    state);
+                        if (count_only_leaves) {
+                            leaves += mult * state.view.size();
+                        } else {
+                            for (std::size_t rep = 0; rep < mult; ++rep) {
+                                expand_view(state.view, hot_tail, hot_limit, state);
+                            }
+                        }
                     }
                     state.batch.clear();
                 }
@@ -298,27 +313,15 @@ public:
     }
 
 private:
-    void expand_view(const ZeroCopyAdjView& view, bool count_only_leaves, std::size_t& leaves,
-                     LocalNodeId*& hot_tail, const LocalNodeId* hot_limit,
-                     TieredBfsState& state) const {
+    void expand_view(const ZeroCopyAdjView& view, LocalNodeId*& hot_tail,
+                     const LocalNodeId* hot_limit, TieredBfsState& state) const {
         for (std::size_t j = 0; j < view.size(); ++j) {
             const NodeId target = view.target(j);
             const LocalNodeId nl = tier_.ensure_local(target);
             if (nl != HotTier::kNotFound) {
-                if (!state.seen_local.insert(nl)) {
-                    continue;
-                }
-                if (count_only_leaves) {
-                    ++leaves;
-                } else {
-                    push_hot(hot_tail, hot_limit, nl);
-                }
-            } else if (state.seen_dynamic.insert(target)) {
-                if (count_only_leaves) {
-                    ++leaves;
-                } else {
-                    state.cold_next.push_back(target);
-                }
+                push_hot(hot_tail, hot_limit, nl);
+            } else {
+                state.cold_next.push_back(target);
             }
         }
     }

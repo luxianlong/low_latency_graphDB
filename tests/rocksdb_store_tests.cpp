@@ -188,6 +188,24 @@ void test_storage_bfs(const std::string& path) {
     require(rejected, "unsorted batch rejected");
 }
 
+std::vector<NodeId> reference_walk(const AdjMap& adj, NodeId start, std::size_t max_depth) {
+    std::vector<NodeId> visited;
+    std::queue<std::pair<NodeId, std::size_t>> q;
+    q.emplace(start, 0);
+    while (!q.empty()) {
+        const auto [u, depth] = q.front();
+        q.pop();
+        visited.push_back(u);
+        if (depth >= max_depth) continue;
+        if (const auto it = adj.find(u); it != adj.end()) {
+            for (const NodeId v : it->second) {
+                q.emplace(v, depth + 1);
+            }
+        }
+    }
+    return visited;
+}
+
 std::vector<NodeId> sorted_ids(std::vector<NodeId> ids) {
     std::sort(ids.begin(), ids.end());
     return ids;
@@ -220,14 +238,14 @@ void test_tiered_graph(const std::string& path) {
         for (std::size_t depth : {0u, 1u, 2u, 4u}) {
             options.max_depth = depth;
             for (NodeId start : {0ull, 1ull, 7ull, 50ull, 499ull}) {
-                auto expected = sorted_ids(reference_bfs(reference, start, depth));
+                auto expected = sorted_ids(reference_walk(reference, start, depth));
                 std::vector<NodeId> got;
                 const std::size_t count = graph.run(start, options, state, &got);
                 if (sorted_ids(got) != expected || count != expected.size() ||
                     graph.run(start, options, state) != expected.size()) {
                     std::cerr << "mismatch: " << label << " start=" << start
                               << " depth=" << depth << '\n';
-                    require(false, "tiered BFS matches reference BFS");
+                    require(false, "tiered traversal matches reference walk");
                 }
             }
         }
@@ -238,6 +256,17 @@ void test_tiered_graph(const std::string& path) {
     check_all("on-demand read-through");
     require(graph.hot_tier().stats().loaded_nodes > 0, "slabs populated on demand");
     require(graph.hot_tier().stats().overflow_edges > 0, "overflow edges stored");
+
+    // Verify duplicate visits occur explicitly across back-edges (depth 2 from 0 revisits 0).
+    {
+        options.max_depth = 2;
+        std::vector<NodeId> got;
+        const std::size_t count = graph.run(0, options, state, &got);
+        const std::size_t zeros =
+            static_cast<std::size_t>(std::count(got.begin(), got.end(), NodeId{0}));
+        require(zeros > 1 && count == got.size(),
+                "duplicate visits allowed without visited set");
+    }
 
     // Subsequent queries hit 100% in FixedSlabPool without touching RocksDB.
     TieredBfsStats stats;
@@ -264,14 +293,17 @@ void test_tiered_graph(const std::string& path) {
                           std::vector<EdgeLightMeta>(original_targets.size()));
     check_all("after COW restore");
 
-    // Small-capacity pool still answers accurately via fallback without losing nodes.
+    // Small-capacity pool still answers accurately via fallback without losing nodes,
+    // including coalescing duplicate cold/miss keys for RocksDB MultiGet.
     {
         TieredGraph small_graph(store, 20);
         TieredBfsState small_state;
         options.max_depth = 3;
         std::vector<NodeId> small_got;
-        (void)small_graph.run(0, options, small_state, &small_got);
-        require(sorted_ids(small_got) == sorted_ids(reference_bfs(reference, 0, 3)),
+        const std::size_t small_count = small_graph.run(0, options, small_state, &small_got);
+        const auto expected = sorted_ids(reference_walk(reference, 0, 3));
+        require(sorted_ids(small_got) == expected && small_count == expected.size() &&
+                    small_graph.run(0, options, small_state) == expected.size(),
                 "small slab pool falls back cleanly when capacity is reached");
     }
 
@@ -297,7 +329,7 @@ void test_tiered_graph(const std::string& path) {
             TieredBfsState local_state;
             TieredBfsOptions local_options;
             local_options.max_depth = 3;
-            const auto expected = reference_bfs(reference, 7, 3).size();
+            const auto expected = reference_walk(reference, 7, 3).size();
             for (int i = 0; i < 300; ++i) {
                 if (graph.run(7, local_options, local_state) != expected) ++bad;
             }

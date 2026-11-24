@@ -151,7 +151,7 @@ Summary run_parallel(std::size_t threads, std::size_t queries_per_thread, std::s
             auto& d = data[t];
             d.samples_ns.reserve(queries_per_thread / std::max<std::size_t>(1, batch) + 1);
             std::size_t visited = 0, hot = 0, cold = 0, pinned = 0, fetched = 0;
-            // Initialize thread_local state (QueryArena + DenseStampSet + ReaderHandle)
+            // Initialize thread_local state (QueryArena + ReaderHandle)
             // before timing starts.
             std::size_t dummy = 0;
             fn(0, dummy, dummy, dummy, dummy, dummy);

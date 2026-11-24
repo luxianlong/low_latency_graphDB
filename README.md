@@ -13,9 +13,7 @@ flowchart TB
     Q[Query: start vertex, max_depth] --> BFS
 
     subgraph TG[TieredGraph - storage/tiered_graph.hpp]
-        BFS[Level-synchronous BFS<br/>one-direction raw QueryArena queue<br/>EpochTracker::ReadGuard]
-        VIS[Visited sets<br/>DenseStampSet: LocalNodeId<br/>GenerationSet: overflow fallback]
-        BFS --- VIS
+        BFS[Level-synchronous traversal<br/>one-direction raw QueryArena queue<br/>no visited set / EpochTracker::ReadGuard]
     end
 
     subgraph T1[Tier 1: HotTier - read-through, storage/hot_tier.hpp]
@@ -47,7 +45,7 @@ flowchart TB
 
 **Write path.** `TieredGraph::write_adjacency` commits atomically to RocksDB first (`WriteBatch`), then performs a live copy-on-write update in `HotTier`: allocates a fresh 64-byte slab from `FixedSlabPool`, atomically exchanges the directory pointer, and retires the old slab (and any overflow edge array) via 3-bucket EBR (`EpochTracker`). Updated hot vertices stay hot immediately with no dirty invalidation or tier rebuild.
 
-**Concurrency.** Hot reads take no locks. Reader threads hold cache-line-isolated `alignas(64)` epoch slots in `EpochTracker` and per-thread `TieredBfsState` (reusable `DenseStampSet` + 16 MiB `QueryArena`).
+**Concurrency.** Hot reads take no locks. Reader threads hold cache-line-isolated `alignas(128)` epoch slots in `EpochTracker` and per-thread `TieredBfsState` (16 MiB `QueryArena`, no visited set).
 
 ---
 
@@ -311,7 +309,6 @@ low_latency_graphDB/
 ├── include/low_latency_graphdb/
 │   ├── query_arena.hpp               # Core: single-chunk 16 MiB bump arena, ArenaScope, ArenaAllocator
 │   ├── graph_node_slab.hpp           # Core: 64B GraphNodeSlab, SlabSlot free-list, FixedSlabPool + EBR EpochTracker
-│   ├── generation_set.hpp            # Core: O(1)-clear GenerationSet & DenseStampSet
 │   ├── adjacency_view.hpp            # Core: zero-copy adjacency decoder (ZeroCopyAdjView)
 │   └── storage/                      # RocksDB integration & tiered engine
 │       ├── storage_codec.hpp         # Big-endian key/value codec for RocksDB
