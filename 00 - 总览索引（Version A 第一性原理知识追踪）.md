@@ -8,6 +8,7 @@
 * [02 \- 64字节缓存行对齐节点与定长槽位池（GraphNodeSlab）](https://docs.google.com/document/d/1VbyfRQTfAH5S2qKZT5IsG73kpMyMQrf7yKWw7JTcHkA/edit) — 解决指针追踪导致的 L1/L2 Cache Miss、跨缓存行分裂与伪共享问题 \[已完成\]  
 * [03 \- 零拷贝存储页视图解码器（ZeroCopyAdjView）](https://docs.google.com/document/d/1LT_7Xk7dxoLLqm0P0Ph9oJ7SMwP0ngQu-vmc9KCeE6E/edit) — 解决从 RocksDB 读取邻接表时的反序列化与冗余内存拷贝问题 \[已完成\]  
 * [04 \- 拓扑与属性物理分离（Topology-Property Separation）与延迟物化设计规范](https://docs.google.com/document/d/1Y36-m-3Ip8QLUKoHkWJ2KYFiMKlUSEel9A5HYrBCfm4/edit) — 解决节点属性与边属性混存导致的缓存行污染、I/O 读放大及热路径反序列化开销 \[已完成\]
+* [节点与边类型过滤及紧凑 Slab 设计](节点与边类型过滤及紧凑%20Slab%20设计.md) — 讨论节点类型位域、边类型过滤及 7/11 条边自适应内联布局 \[设计提案\]
 
 # **后续阶段 — 存储引擎、无锁并发与 I/O 调度（待拆分建档）**
 
